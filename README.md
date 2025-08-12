@@ -1,39 +1,57 @@
-# Agil EV Charging – MVP
+# ⚡ Agil EV Charging – MVP & Analogs + ML Forecasting
 
-This is a minimal, *functional* starter you can run today.
+This project is a **data-driven decision tool** for SNDP Agil in Tunisia to plan electric vehicle (EV) charging infrastructure.  
+It includes a **mapping dashboard**, **site ranking**, **EV adoption forecasting**, and an **analogs-based machine learning page** to estimate when the Tunisian market will be ready for EV chargers.
 
-## Quickstart
+---
+
+## 🚀 Features
+
+### **MVP Core**
+- 🗺 **Map View** – Displays current Agil stations and public EV charging points (from OpenStreetMap).
+- 📊 **Ranking** – Ranks Agil stations by gap to the nearest charger (bigger gap = higher rollout priority).
+- 📈 **Forecast** – Logistic model to project EV growth & chargers needed in Tunisia.
+- 🎲 **Risk Simulation** – Monte Carlo simulation to estimate market viability year.
+
+### **Analogs & ML Page**
+- Fit **logistic curves** for EV adoption in **analog countries** (e.g., Morocco, Egypt, Türkiye).
+- Fit logistic curves for **Tunisia’s historical tech adoption** (Internet, Mobile, etc.).
+- Combine parameters to build **Tunisia EV adoption scenarios**.
+- Export forecast CSV for integration into business planning.
+
+---
+
+## 🛠 Tech Stack
+- **Python 3.10+**
+- **Streamlit** – Interactive web app
+- **Pandas / NumPy** – Data wrangling
+- **SciPy** – Curve fitting
+- **OpenStreetMap Overpass API** – Real geospatial data
+
+---
+
+## ⚡ Quickstart
 
 ```bash
-# 1) Create a virtual environment (Python 3.10+ recommended)
-python -m venv .venv
-source .venv/bin/activate   # Windows: .venv\Scripts\activate
+# 1. Clone the repo
+git clone https://github.com/<your-username>/agil-ev-mvp.git
+cd agil-ev-mvp
 
-# 2) Install deps
+# 2. Create a virtual environment
+python -m venv .venv
+# Windows:
+.venv\Scripts\activate
+# Linux/Mac:
+source .venv/bin/activate
+
+# 3. Install dependencies
 pip install -r requirements.txt
 
-# 3) Fetch OpenStreetMap data (chargers + Agil sites)
+# 4. Fetch OSM data (chargers + Agil sites)
 python fetch_osm_tunisia_ev_agil.py
 
-# 4) Compute nearest-charger distance & ranking
+# 5. Compute nearest-charger distance & ranking
 python process_sites.py
 
-# 5) Launch the Streamlit app
+# 6. Launch the dashboard
 streamlit run app.py
-```
-
-## What you get
-
-- A **map** of Agil stations and public charging points (from OSM).
-- A **ranking** of Agil sites by gap to nearest charger (bigger gap = higher priority).
-- A **forecast** tab with sliders for logistic adoption & chargers needed.
-- A **risk** tab with Monte Carlo on adoption assumptions to get P50/P90 years.
-
-## Data folder
-
-All data is written to `data/`:
-- `tunisia_charging_stations.csv`
-- `tunisia_agil_stations.csv`
-- `processed_sites.csv` (after processing)
-
-You can re-run steps 3–4 anytime to refresh the data.
