@@ -1,0 +1,4 @@
+osm_type,osm_id,kind,name,brand,operator,addr_full,addr_street,addr_city,addr_postcode,opening_hours,phone,website,lat,lon,socket:schuko,socket:type2,socket:type2:output,socket:ccs,socket:ccs2,socket:chademo,capacity,capacity:charging_points,power,maxcurrent,voltage,authentication,operator:wikidata,network,fee,payment:credit_cards,authentication:app,authentication:membership_card,charge:output
+node,12449852375,charging_station,Charging Station Total Kortoba,,TotalEnergies,,,,,,,,34.8391928,10.7647117,,,,,,,,,,,,,Q154037,,,,,,
+way,1159157858,charging_station,shell sidi hassine 2$,,Shell,,,,,,,,36.7643006,10.1192249,,,,,,,,,,,,,Q110716465,,,,,,
+node,4510850190,charging_station,,,,,,,,,,,36.7807266,10.1937043,,,,,,,,,,,,,,,,,,,
