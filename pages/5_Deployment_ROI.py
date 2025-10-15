@@ -1,4 +1,4 @@
-# pages/5_Deployment_ROI.py — Station-level deployment + ROI ranking
+# pages/5_Deployment_ROI.py — Station-level deployment + ROI ranking (complete)
 
 # --- Path bootstrap (must be first) ---
 from pathlib import Path
@@ -12,9 +12,22 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-st.set_page_config(page_title="Deployment ROI (per-station)", layout="wide")
-st.title("🧭 Deployment ROI — station ranking from forecast")
+# Shared UI (neutral nav + breadcrumbs + status pills)
+try:
+    from utils.ui import set_page, sidebar_nav, breadcrumbs, status_pills
+    set_page("Deployment ROI (per-station)", icon="🧭")
+    sidebar_nav(__file__)
+    breadcrumbs([
+        ("Home", "pages/0_Home.py"),
+        ("Deployment ROI", "pages/5_Deployment_ROI.py"),
+    ])
+    status_pills()
+except Exception:
+    # Fallback if utils.ui is not present
+    st.set_page_config(page_title="Deployment ROI (per-station)", layout="wide", page_icon="🧭")
+    st.page_link("pages/6_Chatbot.py", label="💬 Ask the Assistant")
 
+st.title("🧭 Deployment ROI — station ranking from forecast")
 st.caption(
     "Allocate chargers to stations year-by-year to hit your forecast, then compute NPV & payback per station. "
     "Use weighted or round-robin allocation. Download ranked tables for your report."
@@ -30,6 +43,7 @@ def npv_from_cf(cf, rate):
     return float(np.sum(cf / disc))
 
 def payback_year(cf):
+    """Undiscounted payback year (first t where cumulative >= 0). Returns int or None."""
     cum = np.cumsum(cf)
     idx = np.where(cum >= 0)[0]
     return int(idx[0]) if len(idx) else None
@@ -64,26 +78,36 @@ with st.expander("📥 Inputs (auto-loads from session if available)", expanded=
             st.info("Loaded stations from session.")
         up_s = st.file_uploader("Or upload stations CSV", type=["csv"], key="stations_deploy_roi")
         if up_s is not None:
-            stations_df = pd.read_csv(up_s)
+            try:
+                stations_df = pd.read_csv(up_s)
+                st.success(f"Loaded stations: {len(stations_df)} rows.")
+            except Exception as e:
+                st.error(f"Failed to read stations CSV: {e}")
 
     # Forecast
     with c2:
         st.subheader("Forecast (Tunisia)")
-        st.caption("Required columns: year, chargers_needed (cumulative). Optional: ev_stock_tn")
+        st.caption("Required columns: year, chargers_needed (cumulative). Optional: ev_stock")
         forecast_df = None
         if "forecast_df" in st.session_state and isinstance(st.session_state["forecast_df"], pd.DataFrame):
             forecast_df = st.session_state["forecast_df"].copy()
             st.info("Loaded forecast from session.")
         up_f = st.file_uploader("Or upload forecast CSV", type=["csv"], key="forecast_deploy_roi")
         if up_f is not None:
-            forecast_df = pd.read_csv(up_f)
+            try:
+                forecast_df = pd.read_csv(up_f)
+                st.success(f"Loaded forecast: {len(forecast_df)} rows.")
+            except Exception as e:
+                st.error(f"Failed to read forecast CSV: {e}")
 
 # Validation
 if stations_df is None or stations_df.empty:
     st.error("No stations loaded. Load from session or upload a CSV.")
+    st.page_link("pages/0_Smoke_Test.py", label="Go to Data Intake", icon="🧪")
     st.stop()
 if forecast_df is None or forecast_df.empty:
     st.error("No forecast loaded. Load from session or upload a CSV.")
+    st.page_link("pages/0_Smoke_Test.py", label="Go to Data Intake", icon="🧪")
     st.stop()
 
 # Coerce & clean
@@ -159,10 +183,8 @@ def pick_weights(df, need_col_choice):
     elif need_col_choice in df.columns:
         w = pd.to_numeric(df[need_col_choice], errors="coerce")
     else:
-        # fallback
         w = pd.Series(1.0, index=df.index)
     w = w.fillna(w.median() if np.isfinite(w.median()) else 1.0)
-    # normalize to 0..1 (avoid zero variance)
     if w.max() > w.min():
         w_norm = (w - w.min()) / (w.max() - w.min())
     else:
@@ -225,15 +247,12 @@ def allocate_weighted(adds_dict, weights):
         to_place = int(adds_dict.get(t, 0))
         if to_place <= 0:
             continue
-        # multinomial draw (deterministic expectation rounding)
         exp = p * to_place
         base = np.floor(exp).astype(int)
         remainder = to_place - base.sum()
-        # assign the remainder to the highest fractional parts
         frac_rank = np.argsort(-(exp - base))
         for i in range(remainder):
             base[frac_rank[i]] += 1
-        # write into dict
         for idx, count in enumerate(base):
             if count > 0:
                 sid = station_ids[idx]
@@ -305,10 +324,10 @@ if stations_df[["lat","lon"]].dropna().shape[0] > 0 and not df_rank.empty:
 # ---------- Drill-down: one station ----------
 st.write("---")
 st.subheader("🔎 Drill-down a station")
-options = df_rank["station_id"].astype(str) + " — " + df_rank["name"].astype(str)
-pick_label = st.selectbox("Pick a station", options.tolist())
+options = (df_rank["station_id"].astype(str) + " — " + df_rank["name"].astype(str)).tolist()
+pick_label = st.selectbox("Pick a station", options)
 if pick_label:
-    sid = df_rank.loc[options == pick_label, "station_id"].iloc[0]
+    sid = df_rank.loc[(df_rank["station_id"].astype(str) + " — " + df_rank["name"].astype(str)) == pick_label, "station_id"].iloc[0]
     meta = df_rank[df_rank["station_id"] == sid].iloc[0].to_dict()
     cf = per_station_cf[sid]["cf"]
     in_serv = per_station_cf[sid]["in_service"]

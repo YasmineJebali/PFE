@@ -1,4 +1,5 @@
 # pages/2_Analogs_and_ML.py — Analogs fit + ML baseline + Tunisia scenario + comparison
+# Updated: outlier toggles, milestones, correlated (r, t0) uncertainty, robust fallbacks.
 
 # --- 0) Path bootstrap: ensure project root is on sys.path (MUST be first) ---
 from pathlib import Path
@@ -14,6 +15,8 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import altair as alt
+
+st.page_link("pages/6_Chatbot.py", label="💬 Ask the Assistant")
 
 # --- 2) Local package imports (with safe fallbacks) ---
 # Logger
@@ -31,8 +34,17 @@ except Exception:
         return log
 log = get_logger()
 
-# Config paths
+from utils.ui import set_page, sidebar_nav, breadcrumbs, status_pills
+set_page("Analogs & ML Forecasting", icon="📊")
+sidebar_nav(__file__)
+breadcrumbs([
+    ("Home", "pages/0_Home.py"),
+    ("Analogs & ML", "pages/2_Analogs_and_ML.py"),
+])
+status_pills()
 
+
+# Config paths
 try:
     from config import PATHS
 except Exception:
@@ -56,9 +68,45 @@ except Exception:
     USE_PANDERA = False
     log.info("Pandera/schemas not available — validation disabled.")
 
+# Optional: shared analytics helpers (safe fallbacks if file not present)
+try:
+    from utils.analytics import (
+        logistic_milestones, flag_outliers, draw_correlated, analog_rt0_stats
+    )
+    HAVE_ANALYTICS = True
+except Exception:
+    HAVE_ANALYTICS = False
+    log.info("utils.analytics not found — using minimal internal fallbacks.")
+
+    def logistic_milestones(K, r, t0, levels=(0.1, 0.5, 0.9)):
+        out = {}
+        for p in levels:  # t = t0 - (1/r)*ln(1/p - 1)
+            out[int(round(p*100))] = float(t0 - (1.0/r) * np.log(1.0/p - 1.0))
+        return out
+
+    def flag_outliers(series, z=3.0):
+        s = pd.Series(series, dtype=float)
+        m, sd = s.mean(), s.std(ddof=1)
+        sd = sd if sd > 0 else 1.0
+        return (np.abs((s - m) / sd) > z)
+
+    def analog_rt0_stats(fit_rows):
+        arr = np.asarray(fit_rows, float)
+        if arr.shape[0] < 2:
+            mu = np.array([0.35, 2031.0])
+            cov = np.diag([0.05**2, 1.5**2])
+            return mu, cov
+        return arr.mean(axis=0), np.cov(arr.T)
+
+    def draw_correlated(mu, cov, n=2000, seed=42):
+        rng = np.random.default_rng(seed)
+        return rng.multivariate_normal(mu, cov, size=n)
+
 # --- 3) Streamlit page config ---
 st.set_page_config(page_title="Analogs & ML Forecasting", layout="wide")
 st.title("🔬 Analogs & ML Forecasting")
+
+st.caption("Pick a country analog to estimate S-curve parameters, compare fits, then build a Tunisia scenario with uncertainty bands.")
 
 # --- 4) Small helpers ---
 @st.cache_data(show_spinner=False)
@@ -171,8 +219,18 @@ with cL:
     st.subheader("Analog fit (EV stock)")
     pick = st.selectbox("Pick a country", countries, index=0)
 
-    sub = dfA[dfA["country"] == pick].sort_values("year")
-    st.caption(f"{pick} — {len(sub)} data points")
+    sub = dfA[dfA["country"] == pick].sort_values("year").copy()
+
+    # NEW: optional outlier filtering on analog EV stock
+    hide_out = st.checkbox("Hide outliers (z>3) in EV stock", value=False, key="analog_outliers")
+    if hide_out and len(sub) >= 6:
+        mask_out = ~flag_outliers(sub["ev_stock"], z=3.0)
+        dropped = int((~mask_out).sum())
+        if dropped:
+            st.info(f"Outliers hidden: {dropped} point(s).")
+        sub = sub[mask_out].copy()
+
+    st.caption(f"{pick} — {len(sub)} data points after filtering")
     st.dataframe(sub[["country", "iso3", "year", "ev_stock", "public_chargers"]].head(20),
                  use_container_width=True)
 
@@ -185,15 +243,19 @@ with cL:
             f"{pick} fit → K={fit.K:.0f}, r={fit.r:.3f}, t0={fit.t0:.1f} "
             f"(status: {'OK' if fit.success else 'rough-init used'})"
         )
-        rmse, mape = evaluate_fit(years, y, fit.K, fit.r, fit.t0)
-        st.caption(f"Fit quality → RMSE={rmse:.1f}, MAPE={mape:.1%}")
+        rmse_v, mape_v = evaluate_fit(years, y, fit.K, fit.r, fit.t0)
+        st.caption(f"Fit quality → RMSE={rmse_v:.1f}, MAPE={mape_v:.1%}")
         aK, aR, aT0 = float(fit.K), float(fit.r), float(fit.t0)
     else:
         K_r, r_r, t0_r = rough_fit(years, y)
         st.info(f"{pick} rough fit → K≈{K_r:.0f}, r≈{r_r:.3f}, t0≈{t0_r:.1f}")
-        rmse, mape = evaluate_fit(years, y, K_r, r_r, t0_r)
-        st.caption(f"Rough fit quality → RMSE≈{rmse:.1f}, MAPE≈{mape:.1%}")
+        rmse_v, mape_v = evaluate_fit(years, y, K_r, r_r, t0_r)
+        st.caption(f"Rough fit quality → RMSE≈{rmse_v:.1f}, MAPE≈{mape_v:.1%}")
         aK, aR, aT0 = float(K_r), float(r_r), float(t0_r)
+
+    # NEW: Milestones (10/50/90%)
+    ms = logistic_milestones(aK, aR, aT0, levels=(0.1, 0.5, 0.9))
+    st.caption(f"Milestones → 10% in {int(round(ms[10]))}, 50% (t₀) ≈ {int(round(aT0))}, 90% in {int(round(ms[90]))}.")
 
     # Plot actual + fitted curve
     years_line = np.arange(int(years.min()) - 2, int(years.max()) + 6)
@@ -210,11 +272,13 @@ with cL:
             x=alt.X("year:Q"),
             y=alt.Y("value:Q", title="EV stock"),
             color="series:N",
-            tooltip=["year:Q", "series:N", "value:Q"],
+            tooltip=["year:Q", "series:N", alt.Tooltip("value:Q", format=",.0f")],
         )
         .properties(height=300)
     )
-    st.altair_chart(fit_chart, use_container_width=True)
+    # draw t0 vertical rule
+    rule = alt.Chart(pd.DataFrame({"t0":[aT0]})).mark_rule(strokeDash=[6,3]).encode(x="t0:Q")
+    st.altair_chart(fit_chart + rule, use_container_width=True)
 
     # ---- ML baseline (RandomForest) ----
     with st.expander("🤖 Extra ML baseline (RandomForest)"):
@@ -228,7 +292,7 @@ with cL:
             rmse_rf = float(np.sqrt(np.mean((yv.to_numpy() - yhat) ** 2)))
             df_rf = pd.DataFrame({"year": sub["year"], "actual": yv, "RF_pred": yhat}).set_index("year")
             st.line_chart(df_rf)
-            st.caption(f"RandomForest in-sample RMSE = {rmse_rf:.1f}")
+            st.caption(f"RandomForest in-sample RMSE = {rmse_rf:.1f} (for illustration only)")
         else:
             st.info("Need ≥ 5 points for the ML demo.")
 
@@ -242,6 +306,16 @@ with cR:
         techs = sorted(dfTN["tech"].dropna().unique().tolist())
         pick_tech = st.selectbox("Pick a tech", techs, index=0)
         subT = dfTN[dfTN["tech"] == pick_tech].sort_values("year").copy()
+
+        # NEW: optional outlier filtering on tech adoption
+        hide_out_T = st.checkbox("Hide outliers (z>3) in adoption", value=False, key="tntech_outliers")
+        if hide_out_T and len(subT) >= 6:
+            maskT = ~flag_outliers(subT["adoption_pct"], z=3.0)
+            droppedT = int((~maskT).sum())
+            if droppedT:
+                st.info(f"Outliers hidden (tech): {droppedT} point(s).")
+            subT = subT[maskT].copy()
+
         st.caption(f"{pick_tech} — {len(subT)} points")
         st.dataframe(subT.head(20), use_container_width=True)
 
@@ -274,7 +348,7 @@ with cR:
         r_tn_from_tech = float(fitT.r)
         t0_tn_from_tech = float(fitT.t0)
 
-        # ---- Plot: actual points + fitted curve (tech adoption) ----
+        # Plot: actual points + fitted curve (tech adoption)
         years_line_T = np.arange(int(xT.min()) - 2, int(xT.max()) + 6)
         pred_line_T = logistic(years_line_T, fitT.K, fitT.r, fitT.t0)
 
@@ -301,8 +375,8 @@ with cR:
             )
             .properties(height=300)
         )
-        st.altair_chart(tech_chart, use_container_width=True)
-
+        ruleT = alt.Chart(pd.DataFrame({"t0":[fitT.t0]})).mark_rule(strokeDash=[6,3]).encode(x="t0:Q")
+        st.altair_chart(tech_chart + ruleT, use_container_width=True)
 
 # --- 8) Tunisia scenario builder ---
 st.write("---")
@@ -336,6 +410,10 @@ yearsF = np.arange(2022, 2041)
 ev_tn = logistic(yearsF, K_tn, r_tn, t0_tn)
 chargers_needed = (ev_tn / max(ratio, 1)).round(0)
 
+# NEW: milestones for the Tunisia scenario
+ms_tn = logistic_milestones(K_tn, r_tn, t0_tn, levels=(0.1, 0.5, 0.9))
+st.caption(f"Tunisia milestones → 10% in {int(round(ms_tn[10]))}, 50% (t₀) ≈ {int(round(t0_tn))}, 90% in {int(round(ms_tn[90]))}.")
+
 dfF = pd.DataFrame({
     "year": yearsF,
     "ev_stock_tn": ev_tn.astype(int),
@@ -355,6 +433,46 @@ with cDL2:
         dfF.to_csv(outp, index=False)
         st.success(f"Saved: {outp}")
 
+# --- 8.1) Advanced uncertainty based on correlated (r, t0) from analogs ---
+with st.expander("🎲 Advanced uncertainty (correlated r, t₀ from analogs)", expanded=False):
+    st.caption("We derive the joint distribution of (r, t₀) from the selected analog (and optionally more), then simulate Tunisia EV stock paths.")
+    # If you want to allow adding more analogs to the prior, switch default=[pick] to a multiselect.
+    include_ctrys = [pick]
+    # include_ctrys = st.multiselect("Use these analogs to form (r,t₀) prior", countries, default=[pick])
+
+    fit_rows = []
+    for ctry in include_ctrys:
+        d = dfA[dfA["country"] == ctry].sort_values("year")
+        if len(d) >= 4:
+            fr = fit_logistic(d["year"].to_numpy(), d["ev_stock"].to_numpy())
+            fit_rows.append([float(fr.r), float(fr.t0)])
+
+    if fit_rows:
+        mu, cov = analog_rt0_stats(fit_rows)  # mean/cov of (r, t0)
+        sims = st.number_input("Simulations", min_value=200, max_value=10000, value=2000, step=200)
+        samples = draw_correlated(mu, cov, n=int(sims), seed=42)
+
+        years_sim = yearsF
+        EV = []
+        for r_i, t0_i in samples:
+            EV.append(logistic(years_sim, K_tn, float(r_i), float(t0_i)))
+        EV = np.asarray(EV)  # sims x years
+
+        # summarize (P10/P50/P90)
+        p10 = np.percentile(EV, 10, axis=0)
+        p50 = np.percentile(EV, 50, axis=0)
+        p90 = np.percentile(EV, 90, axis=0)
+        df_band = pd.DataFrame({
+            "year": years_sim,
+            "P10": p10.astype(int),
+            "P50": p50.astype(int),
+            "P90": p90.astype(int)
+        })
+        st.line_chart(df_band.set_index("year"))
+        st.caption("EV stock uncertainty bands (P10/P50/P90) using correlated draws of (r, t₀) from analog(s).")
+    else:
+        st.info("Not enough analog points to infer (r, t₀) distribution. Pick another analog with ≥4 points.")
+
 # --- 9) Browse analog curves (gallery) ---
 with st.expander("📚 Browse analog curves (quick look)", expanded=False):
     all_countries = countries  # already filtered to ≥2 points
@@ -363,7 +481,7 @@ with st.expander("📚 Browse analog curves (quick look)", expanded=False):
         df_small = dfA[dfA["country"].isin(sel)].copy()
         pts = alt.Chart(df_small).mark_point(size=40, opacity=0.6).encode(
             x="year:Q", y="ev_stock:Q", color="country:N",
-            tooltip=["country:N", "year:Q", "ev_stock:Q"]
+            tooltip=["country:N", "year:Q", alt.Tooltip("ev_stock:Q", format=",.0f")]
         )
         # quick rough fit line for each selected country
         fits = []
@@ -440,6 +558,7 @@ comp = alt.layer(line_ev, bar_ch).resolve_scale(y="independent").properties(
     width="container", height=380
 )
 st.altair_chart(comp, use_container_width=True)
+st.caption("Lines (left axis): EV stock • Bars (right axis): required chargers — note the two axes.")
 
 st.download_button(
     "Download comparison (CSV)",

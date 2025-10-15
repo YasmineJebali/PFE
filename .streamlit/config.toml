@@ -1,0 +1,7 @@
+[theme]
+base="light"
+primaryColor="#0F766E"        # teal-ish
+backgroundColor="#FFFFFF"
+secondaryBackgroundColor="#F6F7F9"
+textColor="#0F172A"
+font="sans serif"

@@ -1,9 +1,29 @@
+# Core app
 streamlit
 pandas
 numpy
 scikit-learn
-requests
+scipy
+altair
+
+# Maps
 folium
 streamlit-folium
 geopandas
 shapely
+
+# Data validation
+pandera
+
+# Chatbot / RAG
+faiss-cpu
+sentence-transformers
+# transformers  # optional
+
+# Finance / exports
+numpy-financial
+xlsxwriter
+
+prophet==1.1.7
+xgboost==3.0.5
+plotly>=6

@@ -1,0 +1,349 @@
+{
+  "model": "sentence-transformers/all-MiniLM-L6-v2",
+  "docs": [
+    {
+      "source": "README.md",
+      "text": "# Agil EV Charging – MVP This is a minimal, *functional* starter you can run today. ## Quickstart ```bash # 1) Create a virtual environment (Python 3.10+ recommended) python -m venv .venv source .venv/bin/activate # Windows: .venv\\Scripts\\activate # 2) Install deps pip install -r requirements.txt # 3) Fetch OpenStreetMap data (chargers + Agil sites) python fetch_osm_tunisia_ev_agil.py # 4) Compute nearest-charger distance & ranking python process_sites.py # 5) Launch the Streamlit app streamlit run app.py ``` ## What you get"
+    },
+    {
+      "source": "README.md",
+      "text": "- A **map** of Agil stations and public charging points (from OSM). - A **ranking** of Agil sites by gap to nearest charger (bigger gap = higher priority). - A **forecast** tab with sliders for logistic adoption & chargers needed. - A **risk** tab with Monte Carlo on adoption assumptions to get P50/P90 years. ## Data folder All data is written to `data/`: - `tunisia_charging_stations.csv` - `tunisia_agil_stations.csv` - `processed_sites.csv` (after processing) You can re-run steps 3–4 anytime to refresh the data."
+    },
+    {
+      "source": "app.py",
+      "text": "# app.py — Map & Gaps (polished UI + clustered markers + robust guards) import streamlit as st st.set_page_config(page_title=\"Agil EV MVP\", layout=\"wide\") import pandas as pd import numpy as np from pathlib import Path import folium from folium.plugins import MarkerCluster from streamlit_folium import st_folium import altair as alt import math from utils.ui import set_page, sidebar_nav, breadcrumbs, status_pills set_page(\"Agil EV MVP • Map & Gaps\", icon=\"🗺️\") sidebar_nav(__file__) breadcrumbs([ (\"Home\", \"pages/0_Home.py\"), (\"Map & Gaps\", \"app.py\"), ]) status_pills()"
+    },
+    {
+      "source": "app.py",
+      "text": "# breadcrumb & nav st.caption(\"Path: Home → Data Intake → **Map & Gaps** → Analogs & ML → ROI → Deployment ROI\") st.page_link(\"pages/0_Home.py\", label=\"🏠 Home\", icon=\"🏠\") st.page_link(\"pages/2_Analogs_and_ML.py\", label=\"Next → Analogs & ML\", icon=\"📊\") DATA_DIR = Path(\"data\") AGIL_CSV = DATA_DIR / \"tunisia_agil_stations.csv\" CHARGERS_CSV = DATA_DIR / \"tunisia_charging_stations.csv\" PROCESSED_CSV = DATA_DIR / \"processed_sites.csv\" st.title(\"⚡ Agil EV Charging – MVP\") with st.sidebar: st.header(\"Data files\") st.write(\"Expecting CSVs in `data/`\") st.code( \"tunisia_agil_stations.csv\\n\" \"tunisia_charging_stations.csv\\n\" \"processed_sites.csv (after processing)\" ) st.markdown(\"---\") st.caption(\"👩‍💻 *Yasmine Jebali — PFE 2025*\\n\\n**Prédiction du déploiement des bornes VE — SNDP Agil**\")"
+    },
+    {
+      "source": "app.py",
+      "text": "# ----------------------- IO helpers ----------------------- def load_csv(path: Path) -> pd.DataFrame: \"\"\"Load CSV safely → always return a pandas DataFrame (or empty DF).\"\"\" try: if path.exists(): df = pd.read_csv(path) if isinstance(df, np.ndarray): df = pd.DataFrame(df) if not isinstance(df, pd.DataFrame): return pd.DataFrame() return df else: return pd.DataFrame() except Exception as e: st.error(f\"Failed to read {path}: {e}\") return pd.DataFrame() agil = load_csv(AGIL_CSV) chargers = load_csv(CHARGERS_CSV) processed = load_csv(PROCESSED_CSV) # extra guard in case upstream changes if isinstance(agil, np.ndarray): agil = pd.DataFrame(agil) if isinstance(chargers, np.ndarray): chargers = pd.DataFrame(chargers) if isinstance(processed, np.ndarray): processed = pd.DataFrame(processed)"
+    },
+    {
+      "source": "app.py",
+      "text": "# NEW: expose stations to other pages (ROI, Deployment) try: if isinstance(agil, pd.DataFrame) and not agil.empty: # prefer OSM id if present; fallback to sequential ids df_st = agil.copy() if \"osm_id\" in df_st.columns: df_st = df_st.rename(columns={\"osm_id\": \"id\"}) if \"id\" not in df_st.columns: df_st[\"id\"] = np.arange(1, len(df_st) + 1) # keep the essentials; make sure name exists if \"name\" not in df_st.columns: df_st[\"name\"] = \"Agil station\" df_st = df_st[[\"id\", \"name\", \"lat\", \"lon\"]].dropna(subset=[\"lat\", \"lon\"]).reset_index(drop=True) st.session_state[\"stations_df\"] = df_st except Exception: pass"
+    },
+    {
+      "source": "app.py",
+      "text": "# ---------------- Governorate reference (24) ---------------- GOV_COORDS = { \"Ariana\": (36.8625, 10.1956), \"Beja\": (36.7330, 9.1830), \"Ben Arous\": (36.7472, 10.3333), \"Bizerte\": (37.2670, 9.8670), \"Gabes\": (33.8830, 10.1170), \"Gafsa\": (34.4170, 8.7830), \"Jendouba\": (36.5000, 8.7830), \"Kairouan\": (35.6670, 10.1000), \"Kasserine\": (35.1670, 8.8330), \"Kebili\": (33.7019, 8.9736), \"Kef\": (36.1822, 8.7147), \"Mahdia\": (35.5000, 11.0670), \"Manouba\": (36.8078, 10.1011), \"Medenine\": (33.3547, 10.5053), \"Monastir\": (35.7830, 10.8330), \"Nabeul\": (36.7500, 10.7500), \"Sfax\": (34.7330, 10.7670), \"Sidi Bouzid\": (35.0330, 9.5000), \"Siliana\": (36.1670, 9.3670), \"Sousse\": (35.8330, 10.6330), \"Tataouine\": (32.9256, 10.4442), \"Tozeur\": (33.9170, 8.1330), \"Tunis\": (36.8000, 10.1700), \"Zaghouan\": (36.4000, 10.1500) }"
+    },
+    {
+      "source": "app.py",
+      "text": "# 2024-ish population (approx.) GOV_POP = { \"Ariana\": 668_552, \"Beja\": 311_417, \"Ben Arous\": 722_828, \"Bizerte\": 607_388, \"Gabes\": 410_847, \"Gafsa\": 388_776, \"Jendouba\": 404_352, \"Kairouan\": 600_803, \"Kasserine\": 492_741, \"Kebili\": 183_201, \"Kef\": 237_686, \"Mahdia\": 449_985, \"Manouba\": 418_354, \"Medenine\": 537_255, \"Monastir\": 599_769, \"Nabeul\": 863_172, \"Sfax\": 1_047_468, \"Sidi Bouzid\": 489_991, \"Siliana\": 216_242, \"Sousse\": 762_281, \"Tataouine\": 162_654, \"Tozeur\": 120_036, \"Tunis\": 1_075_306, \"Zaghouan\": 201_065 } TOTAL_POP = sum(GOV_POP.values()) GOV_ORDER = list(GOV_COORDS.keys())"
+    },
+    {
+      "source": "app.py",
+      "text": "def nearest_governorate(lat: float, lon: float) -> str | None: \"\"\"Haversine distance to governorate centroids; return closest name.\"\"\" min_dist = float(\"inf\") nearest = None for gov, (glat, glon) in GOV_COORDS.items(): dlat = math.radians(lat - glat) dlon = math.radians(lon - glon) a = math.sin(dlat/2)**2 + math.cos(math.radians(glat))*math.cos(math.radians(lat))*math.sin(dlon/2)**2 c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a)) dist = 6371 * c if dist < min_dist: min_dist = dist nearest = gov return nearest # ---------------------------- TABS ---------------------------- tab_map, tab_rank, tab_forecast, tab_risk = st.tabs( [\"🗺️ Map\", \"🏆 Ranking\", \"📈 Forecast\", \"🎲 Risk\"] )"
+    },
+    {
+      "source": "app.py",
+      "text": "# ============================= MAP ============================= with tab_map: st.subheader(\"Map of Agil stations and public charging points\") st.info( \"This section shows the **current infrastructure footprint**. \" \"Use it to spot geographic gaps and clusters: ⚡ public chargers vs ⛽ Agil stations.\" ) # KPI strip c1, c2, c3, c4 = st.columns(4) c1.metric(\"Agil stations loaded\", f\"{0 if agil.empty else len(agil):,}\") c2.metric(\"Public chargers loaded\", f\"{0 if chargers.empty else len(chargers):,}\") if not agil.empty and not chargers.empty: cov = len(chargers) / max(len(agil), 1) c3.metric(\"Chargers per Agil site\", f\"{cov:.2f}\") else: c3.metric(\"Chargers per Agil site\", \"—\") c4.metric(\"Governorates in data\", f\"{len(GOV_COORDS)}\")"
+    },
+    {
+      "source": "app.py",
+      "text": "# Compute a reasonable center def _center_latlon(agil_df: pd.DataFrame, ch_df: pd.DataFrame) -> tuple[float, float]: lat_series = pd.Series(dtype=float) lon_series = pd.Series(dtype=float) if isinstance(agil_df, pd.DataFrame) and not agil_df.empty and {\"lat\",\"lon\"}.issubset(agil_df.columns): lat_series = pd.concat([lat_series, agil_df[\"lat\"]], ignore_index=True) lon_series = pd.concat([lon_series, agil_df[\"lon\"]], ignore_index=True) if isinstance(ch_df, pd.DataFrame) and not ch_df.empty and {\"lat\",\"lon\"}.issubset(ch_df.columns): lat_series = pd.concat([lat_series, ch_df[\"lat\"]], ignore_index=True) lon_series = pd.concat([lon_series, ch_df[\"lon\"]], ignore_index=True) lat0 = float(np.nanmean(lat_series)) if not lat_series.empty else np.nan lon0 = float(np.nanmean(lon_series)) if not lon_series.empty else np.nan if np.isnan(lat0) or np.isnan(lon0): return 34.0, 9.0 # Tunisia approx center return lat0, lon0"
+    },
+    {
+      "source": "app.py",
+      "text": "lat0, lon0 = _center_latlon(agil, chargers) m = folium.Map(location=[lat0, lon0], zoom_start=6) # Chargers (clustered) if isinstance(chargers, pd.DataFrame) and not chargers.empty and {\"lat\", \"lon\"}.issubset(chargers.columns): ch_cluster = MarkerCluster(name=\"Public chargers\").add_to(m) for _, row in chargers.iterrows(): if pd.notnull(row.get(\"lat\")) and pd.notnull(row.get(\"lon\")): folium.CircleMarker( [row[\"lat\"], row[\"lon\"]], radius=4, color=\"#2a9d8f\", fill=True, fill_opacity=0.8, popup=f\"⚡ {row.get('name','(Charging)')}<br>{row.get('brand','')}\" ).add_to(ch_cluster) else: st.warning(\"⚠️ No valid charger data found (run fetch script or check CSV columns).\")"
+    },
+    {
+      "source": "app.py",
+      "text": "# Agil stations (clustered) if isinstance(agil, pd.DataFrame) and not agil.empty and {\"lat\", \"lon\"}.issubset(agil.columns): ag_cluster = MarkerCluster(name=\"Agil stations\").add_to(m) for _, row in agil.iterrows(): if pd.notnull(row.get(\"lat\")) and pd.notnull(row.get(\"lon\")): folium.CircleMarker( [row[\"lat\"], row[\"lon\"]], radius=4, color=\"#e76f51\", fill=True, fill_opacity=0.8, popup=f\"⛽ {row.get('name','Agil station')}\" ).add_to(ag_cluster) else: st.warning(\"⚠️ No valid Agil station data found (run fetch script or check CSV columns).\") folium.LayerControl(collapsed=False).add_to(m) st_folium(m, width=None, height=600)"
+    },
+    {
+      "source": "app.py",
+      "text": "with st.expander(\"🔎 Data snapshots\"): cL, cR = st.columns(2) with cL: st.caption(\"Agil stations (sample)\") st.dataframe(agil.head(10), use_container_width=True) with cR: st.caption(\"Public chargers (sample)\") st.dataframe(chargers.head(10), use_container_width=True) # ========== RANKING (CITY VIEW + CURVES) ========== with tab_rank: st.subheader(\"City (Governorate) EV Infrastructure & Demand\") st.info( \"We map each Agil station to the nearest governorate and compare \" \"**population share** vs **station share** to spot *underserved* regions. \" \"Then we project city-level EV demand by scaling a national logistic curve by population share.\" )"
+    },
+    {
+      "source": "app.py",
+      "text": "if not (isinstance(agil, pd.DataFrame) and not agil.empty and {\"lat\",\"lon\"}.issubset(agil.columns)): st.info(\"Run the fetch script first to populate `data/` or check your station columns.\") else: # Cache mapping to governorate (recompute if count changed) if ( \"agil_governorate\" not in st.session_state or not isinstance(st.session_state.agil_governorate, pd.DataFrame) or len(st.session_state.agil_governorate) != len(agil) ): agil_copy = agil.copy() agil_copy[\"governorate\"] = agil_copy.apply( lambda r: nearest_governorate(r[\"lat\"], r[\"lon\"]) if pd.notnull(r[\"lat\"]) and pd.notnull(r[\"lon\"]) else None, axis=1 ) st.session_state.agil_governorate = agil_copy[[\"lat\",\"lon\",\"governorate\"]]"
+    },
+    {
+      "source": "app.py",
+      "text": "agil_gov = st.session_state.agil_governorate.copy() counts = agil_gov[\"governorate\"].value_counts().reindex(GOV_ORDER, fill_value=0) gov_df = pd.DataFrame({ \"governorate\": counts.index, \"station_count\": counts.values }) gov_df[\"population\"] = gov_df[\"governorate\"].map(GOV_POP) gov_df[\"pop_share\"] = gov_df[\"population\"] / TOTAL_POP total_stations = gov_df[\"station_count\"].sum() gov_df[\"station_share\"] = gov_df[\"station_count\"] / max(total_stations, 1) gov_df[\"gap_index\"] = (gov_df[\"pop_share\"] - gov_df[\"station_share\"]).round(4) # + => underserved"
+    },
+    {
+      "source": "app.py",
+      "text": "# KPI strip c1, c2, c3 = st.columns(3) c1.metric(\"Stations mapped\", f\"{int(total_stations):,}\") c2.metric(\"Median gap index\", f\"{gov_df['gap_index'].median():+.3f}\") top_underserved = gov_df.sort_values(\"gap_index\", ascending=False).head(1) c3.metric(\"Top underserved\", top_underserved.iloc[0][\"governorate\"] if not top_underserved.empty else \"—\")"
+    },
+    {
+      "source": "app.py",
+      "text": "# Gap chart (population share vs station share) st.markdown(\"### Balance: population vs stations\") df_long = gov_df.melt( id_vars=[\"governorate\"], value_vars=[\"pop_share\", \"station_share\"], var_name=\"metric\", value_name=\"share\" ) chart = ( alt.Chart(df_long) .mark_bar() .encode( x=alt.X(\"governorate:N\", sort=GOV_ORDER, title=\"Governorate\"), y=alt.Y(\"share:Q\", axis=alt.Axis(format=\"%\"), title=\"Share\"), color=alt.Color(\"metric:N\", title=\"Metric\", scale=alt.Scale(scheme=\"tableau10\")), tooltip=[ alt.Tooltip(\"governorate:N\"), alt.Tooltip(\"metric:N\"), alt.Tooltip(\"share:Q\", format=\".1%\"), ], ) .properties(height=320) ) st.altair_chart(chart, use_container_width=True)"
+    },
+    {
+      "source": "app.py",
+      "text": "# Controls for city curves st.divider() st.markdown(\"### City EV curves (national logistic × population share)\") c1, c2, c3, c4 = st.columns(4) with c1: start_year = st.number_input(\"Start year\", min_value=2024, max_value=2040, value=2025, step=1, key=\"city_start\") with c2: end_year = st.number_input(\"End year\", min_value=start_year, max_value=2050, value=2035, step=1, key=\"city_end\") with c3: K = float(st.number_input(\"National Max EV stock K (thousands)\", min_value=5, max_value=1000, value=150, step=5, key=\"cityK\")) * 1000 r = st.number_input(\"Growth rate r\", min_value=0.01, max_value=1.0, value=0.35, step=0.01, key=\"cityr\") with c4: t0 = st.number_input(\"Midpoint year t0\", min_value=2024, max_value=2050, value=2031, step=1, key=\"cityt0\")"
+    },
+    {
+      "source": "app.py",
+      "text": "years = np.arange(start_year, end_year + 1) national_ev = K / (1.0 + np.exp(-r * (years - t0))) # City EV level by scaling national curve with population share city_curves = [] for _, row in gov_df.iterrows(): curve = (row[\"pop_share\"] * national_ev) city_curves.append(pd.DataFrame({ \"year\": years, \"governorate\": row[\"governorate\"], \"ev_stock_city\": curve })) city_curves_df = pd.concat(city_curves, ignore_index=True) # 2030 point estimate (or end_year if earlier) target_year = min(2030, end_year) nat_2030 = float(K / (1.0 + np.exp(-r * (target_year - t0)))) gov_df[f\"est_ev_{target_year}\"] = (gov_df[\"pop_share\"] * nat_2030).astype(int)"
+    },
+    {
+      "source": "app.py",
+      "text": "# Summary & top underserved table st.markdown(\"### Summary tables\") left, right = st.columns([1.5, 1]) with left: show_cols = [\"governorate\", \"population\", \"station_count\", \"pop_share\", \"station_share\", \"gap_index\", f\"est_ev_{target_year}\"] st.dataframe( gov_df.sort_values([\"gap_index\"], ascending=False).reset_index(drop=True)[show_cols], use_container_width=True, height=360 ) with right: st.write(\"**Top 8 underserved (by gap index)**\") st.table( gov_df.sort_values(\"gap_index\", ascending=False).head(8)[[\"governorate\",\"gap_index\"]] .rename(columns={\"governorate\":\"Gov\",\"gap_index\":\"Gap\"}) )"
+    },
+    {
+      "source": "app.py",
+      "text": "# Interactive selection for curves st.markdown(\"### City EV curves\") default_top = gov_df.sort_values(\"gap_index\", ascending=False)[\"governorate\"].head(5).tolist() selected = st.multiselect( \"Select governorates to plot\", options=gov_df[\"governorate\"].tolist(), default=default_top, help=\"Tip: start with the most underserved to visualize demand build-up.\" ) if selected: wide = (city_curves_df[city_curves_df[\"governorate\"].isin(selected)] .pivot(index=\"year\", columns=\"governorate\", values=\"ev_stock_city\") .round(0)) st.line_chart(wide) st.caption(\"Curves show estimated **EV stock per governorate** over time (national logistic × population share).\") else: st.info(\"Pick at least one governorate to draw curves.\")"
+    },
+    {
+      "source": "app.py",
+      "text": "# ======================== NATIONAL FORECAST ======================== with tab_forecast: st.subheader(\"Adoption & charger demand (scenario)\") st.info(\"Model national EV adoption with a logistic curve and derive charger needs via EV/charger ratio.\")"
+    },
+    {
+      "source": "app.py",
+      "text": "col1, col2, col3 = st.columns(3) with col1: start_year = st.number_input(\"Start year\", min_value=2024, max_value=2040, value=2025, step=1) end_year = st.number_input(\"End year\", min_value=start_year, max_value=2050, value=2035, step=1) with col2: K = st.number_input(\"Max EV stock (K, thousands)\", min_value=5, max_value=1000, value=150, step=5) K = float(K) * 1000 # in units r = st.number_input(\"Growth rate r (logistic)\", min_value=0.01, max_value=1.0, value=0.35, step=0.01) with col3: t0 = st.number_input(\"Midpoint year t0\", min_value=2024, max_value=2050, value=2031, step=1) ratio = st.number_input(\"EVs per public charger\", min_value=5, max_value=50, value=18, step=1)"
+    },
+    {
+      "source": "app.py",
+      "text": "years = np.arange(start_year, end_year+1) ev_stock = K / (1.0 + np.exp(-r * (years - t0))) chargers_needed = ev_stock / ratio df = pd.DataFrame({\"year\": years, \"ev_stock\": ev_stock.astype(int), \"chargers_needed\": chargers_needed.astype(int)}) st.line_chart(df.set_index(\"year\")[[\"ev_stock\",\"chargers_needed\"]]) st.caption(\"Tune **K, r, t0** based on analog markets and policy assumptions.\") # NEW — save forecast to session try: st.session_state[\"forecast_df\"] = df.copy() st.toast(\"Forecast saved for ROI pages.\", icon=\"💾\") except Exception: pass"
+    },
+    {
+      "source": "app.py",
+      "text": "# ============================== RISK ============================== with tab_risk: st.subheader(\"Monte Carlo on adoption assumptions\") st.info(\"Simulate uncertainty on r and t0 to estimate the **probable year** when charger demand crosses a threshold.\")"
+    },
+    {
+      "source": "app.py",
+      "text": "col1, col2, col3 = st.columns(3) with col1: ratio_mc = st.number_input(\"EVs per charger (risk)\", min_value=5, max_value=50, value=18, step=1, key=\"ratio_mc\") chargers_threshold = st.number_input(\"Threshold chargers needed (market viability)\", min_value=100, max_value=20000, value=1500, step=50) with col2: r_mean = st.number_input(\"r mean\", min_value=0.05, max_value=1.0, value=0.35, step=0.01) r_sd = st.number_input(\"r std\", min_value=0.0, max_value=0.5, value=0.08, step=0.01) with col3: t0_mean = st.number_input(\"t0 mean\", min_value=2024, max_value=2050, value=2031, step=1, key=\"t0_mean\") t0_sd = st.number_input(\"t0 std\", min_value=0.0, max_value=5.0, value=1.5, step=0.1)"
+    },
+    {
+      "source": "app.py",
+      "text": "sims = st.number_input(\"Simulations\", min_value=100, max_value=10000, value=2000, step=100) horizon = st.slider(\"Forecast horizon (years)\", 2025, 2045, (2025, 2038)) years = np.arange(horizon[0], horizon[1] + 1) K = st.number_input(\"Max EV stock K (risk)\", min_value=10000, max_value=5000000, value=150000, step=10000) rng = np.random.default_rng(42) r_draws = rng.normal(r_mean, r_sd, size=int(sims)) t0_draws = rng.normal(t0_mean, t0_sd, size=int(sims)) hit_years = [] for r_i, t0_i in zip(r_draws, t0_draws): ev = K / (1.0 + np.exp(-r_i * (years - t0_i))) chargers = ev / ratio_mc above = years[chargers >= chargers_threshold] hit_years.append(int(above[0]) if len(above) > 0 else np.nan) hit_series = pd.Series(hit_years) st.bar_chart(hit_series.value_counts().sort_index())"
+    },
+    {
+      "source": "app.py",
+      "text": "import math as _math p50 = hit_series.dropna().quantile(0.5) if hit_series.notna().any() else np.nan p90 = hit_series.dropna().quantile(0.9) if hit_series.notna().any() else np.nan st.write(f\"**P50 year**: {p50:.0f}\" if not _math.isnan(p50) else \"P50 year: n/a\") st.write(f\"**P90 year**: {p90:.0f}\" if not _math.isnan(p90) else \"P90 year: n/a\")"
+    },
+    {
+      "source": "pages\\0_Smoke_Test.py",
+      "text": "import streamlit as st import pandas as pd st.set_page_config(page_title=\"Smoke Test: Data Intake\", layout=\"wide\") st.page_link(\"pages/6_Chatbot.py\", label=\"💬 Ask the Assistant\") st.title(\"🧪 Smoke Test — Data Intake & Validation\") stations = st.file_uploader(\"Upload stations CSV\", type=[\"csv\"]) forecast = st.file_uploader(\"Upload Tunisia forecast CSV\", type=[\"csv\"]) if stations: df = pd.read_csv(stations) st.write(\"Stations preview\", df.head()) st.session_state[\"stations_df\"] = df.copy() if forecast: df = pd.read_csv(forecast) st.write(\"Forecast preview\", df.head()) st.session_state[\"forecast_df\"] = df.copy() if stations and forecast: st.success(\"✅ Both files loaded successfully! You can go to Analogs & ML page now.\") st.page_link(\"app.py\", label=\"Next → Map & Gaps\", icon=\"🗺️\")"
+    },
+    {
+      "source": "pages\\2_Analogs_and_ML.py",
+      "text": "# pages/2_Analogs_and_ML.py — Analogs fit + ML baseline + Tunisia scenario + comparison # Updated: outlier toggles, milestones, correlated (r, t0) uncertainty, robust fallbacks. # --- 0) Path bootstrap: ensure project root is on sys.path (MUST be first) --- from pathlib import Path import sys ROOT = Path(__file__).resolve().parents[1] # .../agil-ev-mvp if str(ROOT) not in sys.path: sys.path.insert(0, str(ROOT)) # ----------------------------------------------------------------------------- # --- 1) Standard imports --- import os import numpy as np import pandas as pd import streamlit as st import altair as alt st.page_link(\"pages/6_Chatbot.py\", label=\"💬 Ask the Assistant\")"
+    },
+    {
+      "source": "pages\\2_Analogs_and_ML.py",
+      "text": "# --- 2) Local package imports (with safe fallbacks) --- # Logger try: from utils.logging_utils import get_logger except Exception: import logging, sys as _sys def get_logger(name=\"agil\"): log = logging.getLogger(name) if not log.handlers: log.setLevel(logging.INFO) h = logging.StreamHandler(_sys.stdout) h.setFormatter(logging.Formatter(\"[%(levelname)s] %(message)s\")) log.addHandler(h) return log log = get_logger() from utils.ui import set_page, sidebar_nav, breadcrumbs, status_pills set_page(\"Analogs & ML Forecasting\", icon=\"📊\") sidebar_nav(__file__) breadcrumbs([ (\"Home\", \"pages/0_Home.py\"), (\"Analogs & ML\", \"pages/2_Analogs_and_ML.py\"), ]) status_pills()"
+    },
+    {
+      "source": "pages\\2_Analogs_and_ML.py",
+      "text": "# Config paths try: from config import PATHS except Exception: class _Paths: analog_csv = ROOT / \"data\" / \"analog_ev_full.csv\" tn_tech_csv = ROOT / \"data\" / \"tn_tech_real.csv\" tn_forecast_out = ROOT / \"data\" / \"tn_ev_forecast.csv\" PATHS = _Paths() # Models & helpers from models.logistic_bass import logistic, fit_logistic, rough_fit, evaluate_fit from sklearn.ensemble import RandomForestRegressor # Optional: Pandera validation (auto-disabled if not installed) try: from schemas import AnalogSchema, TnTechSchema # your schemas.py import pandera as pa USE_PANDERA = True except Exception: AnalogSchema = TnTechSchema = None USE_PANDERA = False log.info(\"Pandera/schemas not available — validation disabled.\")"
+    },
+    {
+      "source": "pages\\2_Analogs_and_ML.py",
+      "text": "# Optional: shared analytics helpers (safe fallbacks if file not present) try: from utils.analytics import ( logistic_milestones, flag_outliers, draw_correlated, analog_rt0_stats ) HAVE_ANALYTICS = True except Exception: HAVE_ANALYTICS = False log.info(\"utils.analytics not found — using minimal internal fallbacks.\") def logistic_milestones(K, r, t0, levels=(0.1, 0.5, 0.9)): out = {} for p in levels: # t = t0 - (1/r)*ln(1/p - 1) out[int(round(p*100))] = float(t0 - (1.0/r) * np.log(1.0/p - 1.0)) return out def flag_outliers(series, z=3.0): s = pd.Series(series, dtype=float) m, sd = s.mean(), s.std(ddof=1) sd = sd if sd > 0 else 1.0 return (np.abs((s - m) / sd) > z)"
+    },
+    {
+      "source": "pages\\2_Analogs_and_ML.py",
+      "text": "def analog_rt0_stats(fit_rows): arr = np.asarray(fit_rows, float) if arr.shape[0] < 2: mu = np.array([0.35, 2031.0]) cov = np.diag([0.05**2, 1.5**2]) return mu, cov return arr.mean(axis=0), np.cov(arr.T) def draw_correlated(mu, cov, n=2000, seed=42): rng = np.random.default_rng(seed) return rng.multivariate_normal(mu, cov, size=n) # --- 3) Streamlit page config --- st.set_page_config(page_title=\"Analogs & ML Forecasting\", layout=\"wide\") st.title(\"🔬 Analogs & ML Forecasting\") st.caption(\"Pick a country analog to estimate S-curve parameters, compare fits, then build a Tunisia scenario with uncertainty bands.\") # --- 4) Small helpers --- @st.cache_data(show_spinner=False) def read_csv_cached(path_or_file): return pd.read_csv(path_or_file)"
+    },
+    {
+      "source": "pages\\2_Analogs_and_ML.py",
+      "text": "def clean_analog_df(df: pd.DataFrame) -> pd.DataFrame: \"\"\"Standardize, coerce numerics, and drop rows missing country/year/ev_stock.\"\"\" df = df.copy() df.columns = [c.strip() for c in df.columns] rename_map = { \"Country\": \"country\", \"country\": \"country\", \"Year\": \"year\", \"YEAR\": \"year\", \"EV stock\": \"ev_stock\", \"EV_stock\": \"ev_stock\", \"ev_stock\": \"ev_stock\", \"Public charging points\": \"public_chargers\", \"public_chargers\": \"public_chargers\", \"ISO3\": \"iso3\", \"iso3\": \"iso3\", } for k, v in rename_map.items(): if k in df.columns and v not in df.columns: df = df.rename(columns={k: v}) for col in [\"year\", \"ev_stock\", \"public_chargers\"]: if col in df.columns: df[col] = pd.to_numeric(df[col], errors=\"coerce\") must_have = [c for c in [\"country\", \"year\", \"ev_stock\"] if c in df.columns] before = len(df) if must_have: df = df.dropna(subset=must_have) dropped = before - len(df) if dropped > 0: st.warning(f\"🧹 Dropped {dropped} row(s) with missing {', '.join(must_have)}.\") return df.reset_index(drop=True)"
+    },
+    {
+      "source": "pages\\2_Analogs_and_ML.py",
+      "text": "def clean_tntech_df(df: pd.DataFrame) -> pd.DataFrame: \"\"\"Standardize tech data: lower cols, numeric year/adoption_pct, drop nulls.\"\"\" df = df.copy() df.columns = [c.strip().lower() for c in df.columns] for col in [\"year\", \"adoption_pct\"]: if col in df.columns: df[col] = pd.to_numeric(df[col], errors=\"coerce\") df = df.dropna(subset=[\"tech\", \"year\", \"adoption_pct\"], how=\"any\").reset_index(drop=True) return df # --- 5) Inputs (upload or defaults) --- st.write(\"---\") with st.expander(\"📥 Inputs\", expanded=True): c1, c2 = st.columns(2)"
+    },
+    {
+      "source": "pages\\2_Analogs_and_ML.py",
+      "text": "with c1: st.subheader(\"Analog EV data\") st.caption(\"Expected columns: country, iso3, year, ev_stock, public_chargers\") up_a = st.file_uploader(\"Upload analogs CSV\", type=[\"csv\"], key=\"analog\") if up_a is not None: dfA = read_csv_cached(up_a) st.info(f\"Loaded uploaded file: {getattr(up_a, 'name', '')}\") elif os.path.exists(PATHS.analog_csv): st.info(f\"Loaded default: {PATHS.analog_csv}\") dfA = read_csv_cached(str(PATHS.analog_csv)) else: dfA = None"
+    },
+    {
+      "source": "pages\\2_Analogs_and_ML.py",
+      "text": "with c2: st.subheader(\"Tunisia tech (WDI)\") st.caption(\"Expected columns: tech (internet/mobile), year, adoption_pct\") up_t = st.file_uploader(\"Upload Tunisia tech CSV\", type=[\"csv\"], key=\"tntech\") if up_t is not None: dfTN = read_csv_cached(up_t) st.info(f\"Loaded uploaded file: {getattr(up_t, 'name', '')}\") elif os.path.exists(PATHS.tn_tech_csv): st.info(f\"Loaded default: {PATHS.tn_tech_csv}\") dfTN = read_csv_cached(str(PATHS.tn_tech_csv)) else: dfTN = None if dfA is None or dfA.empty: st.error(\"No analog EV dataset loaded. Upload a CSV or place one at the default path.\") st.stop()"
+    },
+    {
+      "source": "pages\\2_Analogs_and_ML.py",
+      "text": "# --- 6) Clean & validate data --- dfA = clean_analog_df(dfA) if USE_PANDERA and AnalogSchema is not None: try: dfA = AnalogSchema.validate(dfA) except Exception as e: st.error(\"Analog dataset failed schema validation.\") st.exception(e) st.stop() if dfTN is not None and not dfTN.empty: dfTN = clean_tntech_df(dfTN) if USE_PANDERA and TnTechSchema is not None: try: dfTN = TnTechSchema.validate(dfTN) except Exception as e: st.warning(\"Tunisia tech dataset failed schema validation. Continuing without it.\") st.exception(e) dfTN = None"
+    },
+    {
+      "source": "pages\\2_Analogs_and_ML.py",
+      "text": "# Only keep countries with ≥2 EV-stock points to avoid degenerate fits counts = dfA.groupby(\"country\")[\"ev_stock\"].count() countries = sorted([c for c, n in counts.items() if n >= 2]) if not countries: st.error(\"No countries with at least 2 EV stock points after cleaning.\") st.stop() # --- 7) Analog fit (Left) & Tunisia tech fit (Right) --- st.write(\"---\") cL, cR = st.columns(2) with cL: st.subheader(\"Analog fit (EV stock)\") pick = st.selectbox(\"Pick a country\", countries, index=0) sub = dfA[dfA[\"country\"] == pick].sort_values(\"year\").copy()"
+    },
+    {
+      "source": "pages\\2_Analogs_and_ML.py",
+      "text": "# NEW: optional outlier filtering on analog EV stock hide_out = st.checkbox(\"Hide outliers (z>3) in EV stock\", value=False, key=\"analog_outliers\") if hide_out and len(sub) >= 6: mask_out = ~flag_outliers(sub[\"ev_stock\"], z=3.0) dropped = int((~mask_out).sum()) if dropped: st.info(f\"Outliers hidden: {dropped} point(s).\") sub = sub[mask_out].copy() st.caption(f\"{pick} — {len(sub)} data points after filtering\") st.dataframe(sub[[\"country\", \"iso3\", \"year\", \"ev_stock\", \"public_chargers\"]].head(20), use_container_width=True) years = sub[\"year\"].to_numpy() y = sub[\"ev_stock\"].to_numpy()"
+    },
+    {
+      "source": "pages\\2_Analogs_and_ML.py",
+      "text": "if len(sub) >= 4: fit = fit_logistic(years, y, K0=None, r0=0.30, t0=None) st.success( f\"{pick} fit → K={fit.K:.0f}, r={fit.r:.3f}, t0={fit.t0:.1f} \" f\"(status: {'OK' if fit.success else 'rough-init used'})\" ) rmse_v, mape_v = evaluate_fit(years, y, fit.K, fit.r, fit.t0) st.caption(f\"Fit quality → RMSE={rmse_v:.1f}, MAPE={mape_v:.1%}\") aK, aR, aT0 = float(fit.K), float(fit.r), float(fit.t0) else: K_r, r_r, t0_r = rough_fit(years, y) st.info(f\"{pick} rough fit → K≈{K_r:.0f}, r≈{r_r:.3f}, t0≈{t0_r:.1f}\") rmse_v, mape_v = evaluate_fit(years, y, K_r, r_r, t0_r) st.caption(f\"Rough fit quality → RMSE≈{rmse_v:.1f}, MAPE≈{mape_v:.1%}\") aK, aR, aT0 = float(K_r), float(r_r), float(t0_r)"
+    },
+    {
+      "source": "pages\\2_Analogs_and_ML.py",
+      "text": "# NEW: Milestones (10/50/90%) ms = logistic_milestones(aK, aR, aT0, levels=(0.1, 0.5, 0.9)) st.caption(f\"Milestones → 10% in {int(round(ms[10]))}, 50% (t₀) ≈ {int(round(aT0))}, 90% in {int(round(ms[90]))}.\")"
+    },
+    {
+      "source": "pages\\2_Analogs_and_ML.py",
+      "text": "# Plot actual + fitted curve years_line = np.arange(int(years.min()) - 2, int(years.max()) + 6) pred_line = logistic(years_line, aK, aR, aT0) df_fit = pd.DataFrame({ \"year\": np.r_[years, years_line], \"series\": [\"actual\"] * len(years) + [\"fit\"] * len(years_line), \"value\": np.r_[y, pred_line], }) fit_chart = ( alt.Chart(df_fit) .mark_line(point=True) .encode( x=alt.X(\"year:Q\"), y=alt.Y(\"value:Q\", title=\"EV stock\"), color=\"series:N\", tooltip=[\"year:Q\", \"series:N\", alt.Tooltip(\"value:Q\", format=\",.0f\")], ) .properties(height=300) ) # draw t0 vertical rule rule = alt.Chart(pd.DataFrame({\"t0\":[aT0]})).mark_rule(strokeDash=[6,3]).encode(x=\"t0:Q\") st.altair_chart(fit_chart + rule, use_container_width=True)"
+    },
+    {
+      "source": "pages\\2_Analogs_and_ML.py",
+      "text": "# ---- ML baseline (RandomForest) ---- with st.expander(\"🤖 Extra ML baseline (RandomForest)\"): st.caption(\"Illustrative baseline: train a small RF on years → EV stock.\") if len(sub) >= 5: X = sub[[\"year\"]].astype(float) yv = sub[\"ev_stock\"].astype(float) rf = RandomForestRegressor(n_estimators=300, random_state=0) rf.fit(X, yv) yhat = rf.predict(X) rmse_rf = float(np.sqrt(np.mean((yv.to_numpy() - yhat) ** 2))) df_rf = pd.DataFrame({\"year\": sub[\"year\"], \"actual\": yv, \"RF_pred\": yhat}).set_index(\"year\") st.line_chart(df_rf) st.caption(f\"RandomForest in-sample RMSE = {rmse_rf:.1f} (for illustration only)\") else: st.info(\"Need ≥ 5 points for the ML demo.\")"
+    },
+    {
+      "source": "pages\\2_Analogs_and_ML.py",
+      "text": "with cR: st.subheader(\"Tunisia tech adoption fit (optional)\") if dfTN is None or dfTN.empty: st.info(\"No Tunisia tech file loaded.\") r_tn_from_tech = None t0_tn_from_tech = None else: techs = sorted(dfTN[\"tech\"].dropna().unique().tolist()) pick_tech = st.selectbox(\"Pick a tech\", techs, index=0) subT = dfTN[dfTN[\"tech\"] == pick_tech].sort_values(\"year\").copy() # NEW: optional outlier filtering on tech adoption hide_out_T = st.checkbox(\"Hide outliers (z>3) in adoption\", value=False, key=\"tntech_outliers\") if hide_out_T and len(subT) >= 6: maskT = ~flag_outliers(subT[\"adoption_pct\"], z=3.0) droppedT = int((~maskT).sum()) if droppedT: st.info(f\"Outliers hidden (tech): {droppedT} point(s).\") subT = subT[maskT].copy()"
+    },
+    {
+      "source": "pages\\2_Analogs_and_ML.py",
+      "text": "st.caption(f\"{pick_tech} — {len(subT)} points\") st.dataframe(subT.head(20), use_container_width=True) # Detect whether values exceed 100 (e.g., mobile subscriptions per 100 people) max_val = float(subT[\"adoption_pct\"].max()) dynamic_K_cap = 200.0 if max_val > 100 else 100.0 # Guard against outliers: clip to the chosen cap (so optimizer remains stable) if max_val > dynamic_K_cap: st.warning(f\"{pick_tech}: values exceed {dynamic_K_cap:.0f}. Clipping for stability.\") subT[\"adoption_pct\"] = subT[\"adoption_pct\"].clip(upper=dynamic_K_cap) yT = subT[\"adoption_pct\"].to_numpy() xT = subT[\"year\"].to_numpy()"
+    },
+    {
+      "source": "pages\\2_Analogs_and_ML.py",
+      "text": "# Fit logistic with K bounded to dynamic cap fitT = fit_logistic( xT, yT, K0=min(dynamic_K_cap, max(50.0, yT.max())), r0=0.30, t0=None, bounds=((max(30.0, yT.min()*0.8), 0.01, xT.min() - 10), (dynamic_K_cap, 1.50, xT.max() + 20)) ) rmseT, mapeT = evaluate_fit(xT, yT, fitT.K, fitT.r, fitT.t0) st.success( f\"{pick_tech} fit → K≈{fitT.K:.1f}, r={fitT.r:.3f}, t0={fitT.t0:.1f} \" f\"(RMSE={rmseT:.2f}, MAPE={mapeT:.1%})\" ) r_tn_from_tech = float(fitT.r) t0_tn_from_tech = float(fitT.t0) # Plot: actual points + fitted curve (tech adoption) years_line_T = np.arange(int(xT.min()) - 2, int(xT.max()) + 6) pred_line_T = logistic(years_line_T, fitT.K, fitT.r, fitT.t0)"
+    },
+    {
+      "source": "pages\\2_Analogs_and_ML.py",
+      "text": "df_points_T = pd.DataFrame({ \"year\": xT, \"series\": \"actual\", \"value\": yT }) df_fit_T = pd.DataFrame({ \"year\": years_line_T, \"series\": \"fit\", \"value\": pred_line_T }) df_plot_T = pd.concat([df_points_T, df_fit_T], ignore_index=True) tech_chart = ( alt.Chart(df_plot_T) .mark_line(point=alt.OverlayMarkDef(filled=True, size=45)) .encode( x=alt.X(\"year:Q\", title=\"Year\"), y=alt.Y(\"value:Q\", title=f\"{pick_tech} adoption\"), color=alt.Color(\"series:N\", title=\"Series\"), tooltip=[\"year:Q\", \"series:N\", alt.Tooltip(\"value:Q\", format=\",.2f\")] ) .properties(height=300) ) ruleT = alt.Chart(pd.DataFrame({\"t0\":[fitT.t0]})).mark_rule(strokeDash=[6,3]).encode(x=\"t0:Q\") st.altair_chart(tech_chart + ruleT, use_container_width=True)"
+    },
+    {
+      "source": "pages\\2_Analogs_and_ML.py",
+      "text": "# --- 8) Tunisia scenario builder --- st.write(\"---\") st.subheader(\"🇹🇳 Build Tunisia EV scenario\") seed_r, seed_t0 = float(aR), float(aT0) if (dfTN is not None) and (r_tn_from_tech is not None) and (t0_tn_from_tech is not None): st.caption(\"Tip: use Tunisia tech (internet/mobile) r,t₀ to seed the fields below.\") cA, cB, cC, cD = st.columns(4) with cA: K_tn = st.number_input(\"K (max EV stock, vehicles)\", min_value=1_000, max_value=2_000_000, value=150_000, step=1_000) with cB: r_tn = st.number_input(\"r (growth rate)\", min_value=0.01, max_value=1.50, value=round(seed_r, 3), step=0.01) with cC: t0_tn = st.number_input(\"t₀ (midpoint year)\", min_value=2000, max_value=2050, value=int(round(seed_t0))) with cD: ratio = st.slider(\"EVs per charger\", min_value=8, max_value=30, value=18, step=1)"
+    },
+    {
+      "source": "pages\\2_Analogs_and_ML.py",
+      "text": "if (dfTN is not None) and (r_tn_from_tech is not None) and (t0_tn_from_tech is not None): if st.button(\"Use Tunisia tech fit (r,t₀)\"): r_tn = r_tn_from_tech t0_tn = t0_tn_from_tech st.success(f\"Applied: r={r_tn:.3f}, t₀={t0_tn:.1f} (from TN {pick_tech})\") yearsF = np.arange(2022, 2041) ev_tn = logistic(yearsF, K_tn, r_tn, t0_tn) chargers_needed = (ev_tn / max(ratio, 1)).round(0) # NEW: milestones for the Tunisia scenario ms_tn = logistic_milestones(K_tn, r_tn, t0_tn, levels=(0.1, 0.5, 0.9)) st.caption(f\"Tunisia milestones → 10% in {int(round(ms_tn[10]))}, 50% (t₀) ≈ {int(round(t0_tn))}, 90% in {int(round(ms_tn[90]))}.\") dfF = pd.DataFrame({ \"year\": yearsF, \"ev_stock_tn\": ev_tn.astype(int), \"chargers_needed\": chargers_needed.astype(int) }) st.line_chart(dfF.set_index(\"year\"))"
+    },
+    {
+      "source": "pages\\2_Analogs_and_ML.py",
+      "text": "cDL1, cDL2 = st.columns(2) with cDL1: st.download_button(\"Download Tunisia forecast (CSV)\", data=dfF.to_csv(index=False).encode(), file_name=\"tn_ev_forecast.csv\") with cDL2: if st.button(\"Save forecast to disk\"): outp = str(PATHS.tn_forecast_out) Path(outp).parent.mkdir(parents=True, exist_ok=True) dfF.to_csv(outp, index=False) st.success(f\"Saved: {outp}\")"
+    },
+    {
+      "source": "pages\\2_Analogs_and_ML.py",
+      "text": "# --- 8.1) Advanced uncertainty based on correlated (r, t0) from analogs --- with st.expander(\"🎲 Advanced uncertainty (correlated r, t₀ from analogs)\", expanded=False): st.caption(\"We derive the joint distribution of (r, t₀) from the selected analog (and optionally more), then simulate Tunisia EV stock paths.\") # If you want to allow adding more analogs to the prior, switch default=[pick] to a multiselect. include_ctrys = [pick] # include_ctrys = st.multiselect(\"Use these analogs to form (r,t₀) prior\", countries, default=[pick]) fit_rows = [] for ctry in include_ctrys: d = dfA[dfA[\"country\"] == ctry].sort_values(\"year\") if len(d) >= 4: fr = fit_logistic(d[\"year\"].to_numpy(), d[\"ev_stock\"].to_numpy()) fit_rows.append([float(fr.r), float(fr.t0)])"
+    },
+    {
+      "source": "pages\\2_Analogs_and_ML.py",
+      "text": "if fit_rows: mu, cov = analog_rt0_stats(fit_rows) # mean/cov of (r, t0) sims = st.number_input(\"Simulations\", min_value=200, max_value=10000, value=2000, step=200) samples = draw_correlated(mu, cov, n=int(sims), seed=42) years_sim = yearsF EV = [] for r_i, t0_i in samples: EV.append(logistic(years_sim, K_tn, float(r_i), float(t0_i))) EV = np.asarray(EV) # sims x years"
+    },
+    {
+      "source": "pages\\2_Analogs_and_ML.py",
+      "text": "# summarize (P10/P50/P90) p10 = np.percentile(EV, 10, axis=0) p50 = np.percentile(EV, 50, axis=0) p90 = np.percentile(EV, 90, axis=0) df_band = pd.DataFrame({ \"year\": years_sim, \"P10\": p10.astype(int), \"P50\": p50.astype(int), \"P90\": p90.astype(int) }) st.line_chart(df_band.set_index(\"year\")) st.caption(\"EV stock uncertainty bands (P10/P50/P90) using correlated draws of (r, t₀) from analog(s).\") else: st.info(\"Not enough analog points to infer (r, t₀) distribution. Pick another analog with ≥4 points.\")"
+    },
+    {
+      "source": "pages\\2_Analogs_and_ML.py",
+      "text": "# --- 9) Browse analog curves (gallery) --- with st.expander(\"📚 Browse analog curves (quick look)\", expanded=False): all_countries = countries # already filtered to ≥2 points sel = st.multiselect(\"Choose countries to display\", all_countries, default=[pick][:1]) if sel: df_small = dfA[dfA[\"country\"].isin(sel)].copy() pts = alt.Chart(df_small).mark_point(size=40, opacity=0.6).encode( x=\"year:Q\", y=\"ev_stock:Q\", color=\"country:N\", tooltip=[\"country:N\", \"year:Q\", alt.Tooltip(\"ev_stock:Q\", format=\",.0f\")] ) # quick rough fit line for each selected country fits = [] for c in sel: d = df_small[df_small[\"country\"] == c].sort_values(\"year\") if len(d) >= 2: Kc, rc, t0c = rough_fit(d[\"year\"].to_numpy(), d[\"ev_stock\"].to_numpy()) xs = np.arange(int(d[\"year\"].min()) - 1, int(d[\"year\"].max()) + 5) ys = logistic(xs, Kc, rc, t0c) fits.append(pd.DataFrame({\"year\": xs, \"ev_stock\": ys, \"country\": c, \"series\": \"rough_fit\"})) df_fits = (pd.concat(fits, ignore_index=True) if fits else pd.DataFrame(columns=[\"year\", \"ev_stock\", \"country\", \"series\"])) line = alt.Chart(df_fits).mark_line().encode( x=\"year:Q\", y=\"ev_stock:Q\", color=\"country:N\" ) st.altair_chart((pts + line).properties(height=280), use_container_width=True) else: st.info(\"Pick at least one country to show curves.\")"
+    },
+    {
+      "source": "pages\\2_Analogs_and_ML.py",
+      "text": "# --- 10) Comparison: Tunisia vs Analog (dual-axis, right axis=chargers) --- st.write(\"---\") st.subheader(\"📈 Comparison: Tunisia scenario vs selected analog\") mode = st.radio(\"Analog curve mode\", [\"Analog own K\", \"Scale analog speed to Tunisia K\"], horizontal=True) if mode == \"Analog own K\": analog_curve = logistic(yearsF, aK, aR, aT0) analog_label = f\"{pick} (own K≈{int(aK):,})\" else: analog_curve = logistic(yearsF, K_tn, aR, aT0) analog_label = f\"{pick} (scaled to Tunisia K={int(K_tn):,})\" df_compare = pd.DataFrame({ \"year\": yearsF, \"Tunisia EV stock (scenario)\": ev_tn.astype(int), analog_label: analog_curve.astype(int), \"Tunisia chargers (scenario)\": chargers_needed.astype(int), })"
+    },
+    {
+      "source": "pages\\2_Analogs_and_ML.py",
+      "text": "# EV stock (lines, LEFT axis) df_ev = df_compare.melt( id_vars=\"year\", value_vars=[\"Tunisia EV stock (scenario)\", analog_label], var_name=\"series\", value_name=\"ev_stock\" ) line_ev = ( alt.Chart(df_ev) .mark_line(point=False) .encode( x=alt.X(\"year:Q\", title=\"Year\"), y=alt.Y(\"ev_stock:Q\", title=\"EV stock (vehicles)\", axis=alt.Axis(titleColor=\"#4e79a7\")), color=alt.Color(\"series:N\", title=\"EV stock series\"), tooltip=[alt.Tooltip(\"year:Q\"), alt.Tooltip(\"series:N\"), alt.Tooltip(\"ev_stock:Q\", format=\",.0f\")] ) )"
+    },
+    {
+      "source": "pages\\2_Analogs_and_ML.py",
+      "text": "# Chargers (bars, RIGHT axis) df_ch = df_compare[[\"year\", \"Tunisia chargers (scenario)\"]].rename( columns={\"Tunisia chargers (scenario)\": \"chargers\"} ) bar_ch = ( alt.Chart(df_ch) .mark_bar(opacity=0.35) .encode( x=\"year:Q\", y=alt.Y(\"chargers:Q\", title=\"Chargers (units)\", axis=alt.Axis(titleColor=\"#f28e2b\", orient=\"right\")), tooltip=[alt.Tooltip(\"year:Q\"), alt.Tooltip(\"chargers:Q\", format=\",.0f\")] ) ) comp = alt.layer(line_ev, bar_ch).resolve_scale(y=\"independent\").properties( width=\"container\", height=380 ) st.altair_chart(comp, use_container_width=True) st.caption(\"Lines (left axis): EV stock • Bars (right axis): required chargers — note the two axes.\") st.download_button( \"Download comparison (CSV)\", data=df_compare.to_csv(index=False).encode(), file_name=\"tn_vs_analog_comparison.csv\" )"
+    },
+    {
+      "source": "pages\\4_ROI_Sensitivity.py",
+      "text": "# pages/4_ROI_Sensitivity.py — ROI with Payback, Discounted Payback, IRR, Portfolio, Tornado, Charts & Excel pack # --- Path bootstrap (must be first) --- from pathlib import Path import sys ROOT = Path(__file__).resolve().parents[1] if str(ROOT) not in sys.path: sys.path.insert(0, str(ROOT)) # -------------------------------------- import io import numpy as np import pandas as pd import streamlit as st import altair as alt from utils.ui import set_page, sidebar_nav, breadcrumbs, status_pills set_page(\"ROI & Sensitivity\", icon=\"💸\") sidebar_nav(__file__) breadcrumbs([ (\"Home\", \"pages/0_Home.py\"), (\"ROI & Sensitivity\", \"pages/4_ROI_Sensitivity.py\"), ]) status_pills() st.page_link(\"pages/6_Chatbot.py\", label=\"💬 Ask the Assistant\")"
+    },
+    {
+      "source": "pages\\4_ROI_Sensitivity.py",
+      "text": "# Optional config (paths) try: from config import PATHS except Exception: class _Paths: tn_forecast_out = ROOT / \"data\" / \"tn_ev_forecast.csv\" PATHS = _Paths() st.set_page_config(page_title=\"ROI Sensitivity\", layout=\"wide\") st.title(\"💸 ROI — NPV, Payback, Discounted Payback, IRR, Portfolio & Tornado\") st.caption( \"Tune unit economics. Optionally link to your Tunisia forecast to compute a portfolio NPV. \" \"See discounted payback visually and export everything to Excel.\" ) # ---------------- Helpers ---------------- def annual_net_profit_per_charger(margin_tnd_per_kwh, kwh_per_session, sessions_per_day, opex_per_year): revenue_y = margin_tnd_per_kwh * kwh_per_session * sessions_per_day * 365.0 return float(revenue_y - opex_per_year)"
+    },
+    {
+      "source": "pages\\4_ROI_Sensitivity.py",
+      "text": "def cashflows_per_charger(capex, net_profit_per_year, years): \"\"\"CF[0..years] undiscounted, capex at t=0 (negative), then yearly net profit.\"\"\" cf = np.zeros(years + 1, dtype=float) cf[0] = -capex if years >= 1: cf[1:] = net_profit_per_year return cf def npv_from_cf(cf, rate): disc = np.array([(1.0 + rate) ** t for t in range(len(cf))], dtype=float) return float(np.sum(cf / disc)) def payback_year(cf): \"\"\"Undiscounted payback year (first t where cumulative >= 0). Returns int or None.\"\"\" cum = np.cumsum(cf) idx = np.where(cum >= 0)[0] return int(idx[0]) if len(idx) else None"
+    },
+    {
+      "source": "pages\\4_ROI_Sensitivity.py",
+      "text": "def discounted_payback_year(cf, rate): \"\"\"Discounted payback (first t where discounted cumulative >= 0). Returns int or None.\"\"\" disc = np.array([(1.0 + rate) ** t for t in range(len(cf))], dtype=float) cum_disc = np.cumsum(cf / disc) idx = np.where(cum_disc >= 0)[0] return int(idx[0]) if len(idx) else None def irr_from_cf(cf, guess=0.1): \"\"\" IRR using numpy_financial if available; otherwise robust bisection on [-0.99, 5.0]. Returns float or None if no sign change / no root. \"\"\" try: import numpy_financial as npf val = float(npf.irr(cf)) if np.isfinite(val): return val except Exception: pass"
+    },
+    {
+      "source": "pages\\4_ROI_Sensitivity.py",
+      "text": "# Fallback: bisection def npv_at(r): return npv_from_cf(cf, r) lo, hi = -0.99, 5.0 f_lo, f_hi = npv_at(lo), npv_at(hi) if np.isnan(f_lo) or np.isnan(f_hi) or f_lo * f_hi > 0: return None # no guaranteed root for _ in range(80): mid = 0.5 * (lo + hi) f_mid = npv_at(mid) if not np.isfinite(f_mid): return None if abs(f_mid) < 1e-9: return float(mid) if f_lo * f_mid <= 0: hi, f_hi = mid, f_mid else: lo, f_lo = mid, f_mid return float(0.5 * (lo + hi))"
+    },
+    {
+      "source": "pages\\4_ROI_Sensitivity.py",
+      "text": "def build_portfolio_cashflows(adds_by_year, capex, net_profit_per_year, years): \"\"\" Portfolio CF with installs over time: - capex applied in the install year for the number of new chargers - operating net profit each year = net_profit_per_year * chargers_in_service_that_year \"\"\" T = years adds = np.zeros(T + 1, dtype=float) for t, n in adds_by_year.items(): if 0 <= t <= T: adds[t] += float(max(n, 0)) cf = np.zeros(T + 1, dtype=float) cf -= capex * adds # capex at install in_service = np.cumsum(adds) cf[1:] += net_profit_per_year * in_service[1:] # operating profit return cf, in_service"
+    },
+    {
+      "source": "pages\\4_ROI_Sensitivity.py",
+      "text": "def make_tornado(rowspecs, pct=0.2): \"\"\"rowspecs: list of (name, base_value, fn(value)) → returns DataFrame sorted by impact.\"\"\" out = [] for name, base, fn in rowspecs: low_v, high_v = base * (1 - pct), base * (1 + pct) npv_low, npv_high = float(fn(low_v)), float(fn(high_v)) lo, hi = sorted([npv_low, npv_high]) out.append({\"param\": name, \"low\": lo, \"high\": hi, \"impact\": abs(hi - lo)}) df = pd.DataFrame(out).sort_values(\"impact\", ascending=True) return df"
+    },
+    {
+      "source": "pages\\4_ROI_Sensitivity.py",
+      "text": "def discounted_cumulative_df(cf, rate, label=\"Per-charger\"): \"\"\"Return table with year, undiscounted CF, discounted CF, and cumulative discounted CF.\"\"\" years_idx = np.arange(0, len(cf)) disc = np.array([(1.0 + rate) ** t for t in years_idx], dtype=float) disc_cf = cf / disc cum_disc = np.cumsum(disc_cf) return pd.DataFrame({ \"year\": years_idx, \"cashflow\": cf, \"discounted_cf\": disc_cf, \"cum_discounted_cf\": cum_disc, \"series\": label })"
+    },
+    {
+      "source": "pages\\4_ROI_Sensitivity.py",
+      "text": "def discounted_cum_chart(df, title=\"Discounted cumulative cashflow\"): base = alt.Chart(df) line = base.mark_line(point=True).encode( x=alt.X(\"year:Q\", title=\"Year (t)\"), y=alt.Y(\"cum_discounted_cf:Q\", title=\"Cumulative discounted cashflow (TND)\"), color=alt.Color(\"series:N\", title=\"Series\"), tooltip=[ alt.Tooltip(\"year:Q\"), alt.Tooltip(\"cum_discounted_cf:Q\", format=\",.0f\"), ], ) zero = alt.Chart(pd.DataFrame({\"y\": [0]})).mark_rule(strokeDash=[6,3], color=\"black\").encode(y=\"y:Q\") return (line + zero).properties(title=title, height=320)"
+    },
+    {
+      "source": "pages\\4_ROI_Sensitivity.py",
+      "text": "# ---------------- Inputs ---------------- c1, c2, c3, c4, c5 = st.columns(5) capex = c1.number_input(\"CAPEX per charger (TND)\", 2000, 200000, 36000, step=1000) opex = c2.number_input(\"OPEX per year (TND)\", 200, 50000, 2500, step=100) margin= c3.number_input(\"Margin per kWh (TND)\", 0.05, 5.0, 0.55, step=0.05, format=\"%.2f\") kwh = c4.number_input(\"kWh per session\", 5, 150, 22, step=1) sess = c5.number_input(\"Sessions per day\", 1, 100, 3, step=1) years = st.slider(\"Project horizon (years)\", 3, 20, 8, 1) rate = st.slider(\"Discount rate\", 0.01, 0.30, 0.11, 0.01, format=\"%.2f\") net_profit_y = annual_net_profit_per_charger(margin, kwh, sess, opex) # ---------------- Per-charger model ---------------- st.write(\"---\") st.subheader(\"Per-charger economics\")"
+    },
+    {
+      "source": "pages\\4_ROI_Sensitivity.py",
+      "text": "cf_unit = cashflows_per_charger(capex, net_profit_y, years) npv_unit = npv_from_cf(cf_unit, rate) pb_unit = payback_year(cf_unit) dpb_unit = discounted_payback_year(cf_unit, rate) irr_unit = irr_from_cf(cf_unit) mcol1, mcol2, mcol3 = st.columns(3) mcol1.metric(\"NPV per charger (TND)\", f\"{npv_unit:,.0f}\") mcol2.metric(\"Payback (undiscounted)\", \"No payback\" if pb_unit is None else f\"Year {pb_unit}\") mcol3.metric(\"Discounted payback\", \"No payback\" if dpb_unit is None else f\"Year {dpb_unit}\") mcol4, _ = st.columns([1,2]) mcol4.metric(\"IRR\", \"n/a\" if irr_unit is None else f\"{irr_unit*100:.1f}%\") st.caption(\"Cashflows per charger (undiscounted):\") df_unit_cf = pd.DataFrame({\"year\": np.arange(0, years + 1), \"cashflow\": cf_unit}) st.bar_chart(df_unit_cf.set_index(\"year\"))"
+    },
+    {
+      "source": "pages\\4_ROI_Sensitivity.py",
+      "text": "# NEW: discounted cumulative chart for per-charger df_unit_disc = discounted_cumulative_df(cf_unit, rate, label=\"Per-charger\") st.altair_chart(discounted_cum_chart(df_unit_disc, \"Discounted cumulative — per charger\"), use_container_width=True) st.download_button( \"⬇️ Download per-charger cashflows (CSV)\", data=df_unit_cf.to_csv(index=False).encode(), file_name=\"per_charger_cashflows.csv\", use_container_width=True, ) # ---------------- Portfolio (link to forecast) ---------------- st.write(\"---\") st.subheader(\"Portfolio mode (link to Tunisia forecast)\") use_portfolio = st.checkbox(\"Use forecast-linked portfolio NPV\", value=False, help=\"If checked, we load tn_ev_forecast.csv and compute NPV for a growing fleet.\")"
+    },
+    {
+      "source": "pages\\4_ROI_Sensitivity.py",
+      "text": "dfF = None src_msg = None if use_portfolio: if \"forecast_df\" in st.session_state and isinstance(st.session_state[\"forecast_df\"], pd.DataFrame): dfF = st.session_state[\"forecast_df\"].copy() src_msg = \"Loaded forecast from session.\" else: default_p = Path(PATHS.tn_forecast_out) up = st.file_uploader(\"Upload tn_ev_forecast.csv (columns: year, ev_stock_tn, chargers_needed)\", type=[\"csv\"], key=\"upload_forecast_roi\") if up is not None: dfF = pd.read_csv(up) src_msg = f\"Loaded uploaded file: {getattr(up, 'name', '')}\" elif default_p.exists(): dfF = pd.read_csv(default_p) src_msg = f\"Loaded default: {default_p}\" if use_portfolio and (dfF is None or dfF.empty): st.warning(\"No forecast available. Uncheck portfolio mode or upload a forecast CSV.\") use_portfolio = False"
+    },
+    {
+      "source": "pages\\4_ROI_Sensitivity.py",
+      "text": "adds_by_year_idx = {} if use_portfolio: st.caption(src_msg) need_cols = {\"year\", \"chargers_needed\"} missing = need_cols - set(dfF.columns) if missing: st.error(f\"Forecast missing required columns: {', '.join(sorted(missing))}\") use_portfolio = False else: dfF = dfF[[\"year\", \"chargers_needed\"]].dropna().copy() dfF[\"year\"] = pd.to_numeric(dfF[\"year\"], errors=\"coerce\") dfF[\"chargers_needed\"] = pd.to_numeric(dfF[\"chargers_needed\"], errors=\"coerce\") dfF = dfF.dropna().sort_values(\"year\").reset_index(drop=True) if use_portfolio: st.dataframe(dfF.head(15), use_container_width=True)"
+    },
+    {
+      "source": "pages\\4_ROI_Sensitivity.py",
+      "text": "st.caption(\"Using forecast for portfolio NPV.\") st.page_link(\"pages/5_Deployment_ROI.py\", label=\"Next → Deployment ROI\", icon=\"🧭\") # Convert cumulative \"chargers_needed\" into yearly additions y0 = int(dfF[\"year\"].iloc[0]) cum = dfF[\"chargers_needed\"].to_numpy() adds = np.r_[cum[0], np.diff(cum)] adds = np.where(adds < 0, 0, adds) # Build schedule dict: year_index (0..years) -> adds for i, y in enumerate(dfF[\"year\"]): t = int(y - y0) if 0 <= t <= years: adds_by_year_idx[t] = adds[i] cf_port, in_service = build_portfolio_cashflows(adds_by_year_idx, capex, net_profit_y, years) npv_port = npv_from_cf(cf_port, rate) pb_port = payback_year(cf_port) dpb_port = discounted_payback_year(cf_port, rate) irr_port = irr_from_cf(cf_port)"
+    },
+    {
+      "source": "pages\\4_ROI_Sensitivity.py",
+      "text": "cA, cB, cC = st.columns(3) cA.metric(\"Portfolio NPV (TND)\", f\"{npv_port:,.0f}\") cB.metric(\"Payback (undiscounted)\", \"No payback\" if pb_port is None else f\"Year {pb_port}\") cC.metric(\"Discounted payback\", \"No payback\" if dpb_port is None else f\"Year {dpb_port}\") cD, _ = st.columns([1,2]) cD.metric(\"Portfolio IRR\", \"n/a\" if irr_port is None else f\"{irr_port*100:.1f}%\") st.caption(\"Chargers in service and annual cashflow (portfolio):\") df_port = pd.DataFrame({ \"year_index\": np.arange(0, years + 1), \"chargers_in_service\": in_service, \"cashflow\": cf_port }) st.line_chart(df_port.set_index(\"year_index\")[[\"chargers_in_service\"]]) st.bar_chart(df_port.set_index(\"year_index\")[[\"cashflow\"]])"
+    },
+    {
+      "source": "pages\\4_ROI_Sensitivity.py",
+      "text": "# NEW: discounted cumulative chart for portfolio df_port_disc = discounted_cumulative_df(cf_port, rate, label=\"Portfolio\") st.altair_chart(discounted_cum_chart(df_port_disc, \"Discounted cumulative — portfolio\"), use_container_width=True) st.download_button( \"⬇️ Download portfolio cashflows (CSV)\", data=df_port.to_csv(index=False).encode(), file_name=\"portfolio_cashflows.csv\", use_container_width=True, ) else: df_port = None df_port_disc = None # ---------------- Tornado sensitivity ---------------- st.write(\"---\") st.subheader(\"Tornado sensitivity (±20%)\")"
+    },
+    {
+      "source": "pages\\4_ROI_Sensitivity.py",
+      "text": "if use_portfolio: # Sensitivity recomputing PORTFOLIO NPV def npv_with(capex_=None, opex_=None, margin_=None, kwh_=None, sess_=None, rate_=None): capex_i = capex if capex_ is None else capex_ opex_i = opex if opex_ is None else opex_ rate_i = rate if rate_ is None else rate_ margin_i= margin if margin_ is None else margin_ kwh_i = kwh if kwh_ is None else kwh_ sess_i = sess if sess_ is None else sess_ net_i = annual_net_profit_per_charger(margin_i, kwh_i, sess_i, opex_i) cf_i, _ = build_portfolio_cashflows(adds_by_year_idx, capex_i, net_i, years) return npv_from_cf(cf_i, rate_i)"
+    },
+    {
+      "source": "pages\\4_ROI_Sensitivity.py",
+      "text": "rowspecs = [ (\"CAPEX\", capex, lambda v: npv_with(capex_=v)), (\"OPEX\", opex, lambda v: npv_with(opex_=v)), (\"Margin/kWh\", margin, lambda v: npv_with(margin_=v)), (\"kWh/session\", kwh, lambda v: npv_with(kwh_=v)), (\"Sessions/day\", sess, lambda v: npv_with(sess_=v)), (\"Discount rate\", rate, lambda v: npv_with(rate_=v)), ] base_cf = build_portfolio_cashflows(adds_by_year_idx, capex, net_profit_y, years)[0] else: # Sensitivity recomputing PER-CHARGER NPV def npv_with(capex_=None, opex_=None, margin_=None, kwh_=None, sess_=None, rate_=None): capex_i = capex if capex_ is None else capex_ opex_i = opex if opex_ is None else opex_ rate_i = rate if rate_ is None else rate_ margin_i= margin if margin_ is None else margin_ kwh_i = kwh if kwh_ is None else kwh_ sess_i = sess if sess_ is None else sess_ net_i = annual_net_profit_per_charger(margin_i, kwh_i, sess_i, opex_i) cf_i = cashflows_per_charger(capex_i, net_i, years) return npv_from_cf(cf_i, rate_i)"
+    },
+    {
+      "source": "pages\\4_ROI_Sensitivity.py",
+      "text": "rowspecs = [ (\"CAPEX\", capex, lambda v: npv_with(capex_=v)), (\"OPEX\", opex, lambda v: npv_with(opex_=v)), (\"Margin/kWh\", margin, lambda v: npv_with(margin_=v)), (\"kWh/session\", kwh, lambda v: npv_with(kwh_=v)), (\"Sessions/day\", sess, lambda v: npv_with(sess_=v)), (\"Discount rate\", rate, lambda v: npv_with(rate_=v)), ] base_cf = cashflows_per_charger(capex, net_profit_y, years) df_tornado = make_tornado(rowspecs=rowspecs, pct=0.2) base_npv = npv_from_cf(base_cf, rate)"
+    },
+    {
+      "source": "pages\\4_ROI_Sensitivity.py",
+      "text": "base_line = alt.Chart(pd.DataFrame({\"NPV\": [base_npv]})).mark_rule(color=\"black\").encode(x=\"NPV:Q\") bars = alt.Chart(df_tornado).mark_bar().encode( y=alt.Y(\"param:N\", title=\"Parameter\"), x=alt.X(\"low:Q\", title=\"NPV (TND)\"), x2=\"high:Q\", tooltip=[alt.Tooltip(\"param:N\"), alt.Tooltip(\"low:Q\", format=\",.0f\"), alt.Tooltip(\"high:Q\", format=\",.0f\")] ).properties(height=280) st.altair_chart((bars + base_line).resolve_scale(x=\"shared\"), use_container_width=True) st.download_button( \"⬇️ Download tornado table (CSV)\", data=df_tornado.to_csv(index=False).encode(), file_name=\"tornado_table.csv\", use_container_width=True, ) # ---------------- Excel Export Pack ---------------- st.write(\"---\") st.subheader(\"📦 Export Excel pack\")"
+    },
+    {
+      "source": "pages\\4_ROI_Sensitivity.py",
+      "text": "# Build assumptions sheet assumptions = pd.DataFrame({ \"parameter\": [\"CAPEX per charger (TND)\", \"OPEX per year (TND)\", \"Margin per kWh (TND)\", \"kWh per session\", \"Sessions per day\", \"Project horizon (years)\", \"Discount rate\"], \"value\": [capex, opex, margin, kwh, sess, years, rate], }) # Collect tables for export sheets = { \"Assumptions\": assumptions, \"PerCharger_CF\": df_unit_cf, \"PerCharger_Discounted\": df_unit_disc[[\"year\", \"discounted_cf\", \"cum_discounted_cf\"]], \"Tornado\": df_tornado, } if use_portfolio and df_port is not None: sheets[\"Portfolio_CF\"] = df_port sheets[\"Portfolio_Discounted\"] = df_port_disc[[\"year\", \"discounted_cf\", \"cum_discounted_cf\"]].rename(columns={\"year\": \"year_index\"})"
+    },
+    {
+      "source": "pages\\4_ROI_Sensitivity.py",
+      "text": "# Write to an in-memory Excel file buf = io.BytesIO() engine = None for candidate in (\"xlsxwriter\", \"openpyxl\"): try: with pd.ExcelWriter(buf, engine=candidate) as xw: for name, df in sheets.items(): df.to_excel(xw, sheet_name=name, index=False) engine = candidate break except Exception: buf = io.BytesIO() # reset and try next engine continue if engine is None: st.error(\"Could not find an Excel engine. Try: pip install xlsxwriter (or openpyxl).\") else: st.success(f\"Excel built with engine: {engine}\") st.download_button( \"⬇️ Download ROI pack (Excel)\", data=buf.getvalue(), file_name=\"roi_pack.xlsx\", mime=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet\", use_container_width=True, )"
+    },
+    {
+      "source": "data\\tunisia_agil_stations.csv",
+      "text": "CSV tunisia_agil_stations.csv columns=['osm_type', 'osm_id', 'kind', 'name', 'brand', 'operator', 'addr_full', 'addr_street', 'addr_city', 'addr_postcode', 'opening_hours', 'phone', 'website', 'lat', 'lon'] sample=[{\"osm_type\": \"node\", \"osm_id\": 2094071829, \"kind\": \"fuel_agil\", \"name\": \" عجبل\", \"brand\": \"Agil\", \"operator\": \"Agil\", \"addr_full\": NaN, \"addr_street\": NaN, \"addr_city\": NaN, \"addr_postcode\": NaN, \"opening_hours\": NaN, \"phone\": NaN, \"website\": NaN, \"lat\": 35.8135428, \"lon\": 10.6286645}, {\"osm_type\": \"node\", \"osm_id\": 3201919571, \"kind\": \"fuel_agil\", \"name\": \"AGIL Jelma\", \"brand\": \"عجيل\", \"operator\": NaN, \"addr_full\": NaN, \"addr_street\": NaN, \"addr_city\": \"Jelma\", \"addr_postcode\": NaN, \"opening_hours\": NaN, \"phone\": NaN, \"website\": NaN, \"lat\": 35.2698144, \"lon\": 9.4181454}, {\"osm_type\": \"node\", \"osm_id\": 3201908000, \"kind\": \"fuel_agil\", \"name\": \"AGIL Sidi Aich\", \"brand\": \"Agil\", \"operator\": NaN, \"addr_full\": NaN, \"addr_street\": NaN, \"addr_city\": \"Sidi Aich\", \"addr_postcode\": NaN, \"opening_hours\": NaN, \"phone\": NaN, \"website\": NaN, \"lat\": 34.7314404, \"lon\": 8.783073}, {\"osm_type\": \"node\", \"osm_id\": 1808578229, \"kind\": \"fuel_agil\", \"name\": \"AGIL Sidi Bennour\", \"brand\": \"AGIL\", \"operator\": NaN, \"addr_full\": NaN, \"addr_street\": NaN, \"addr_city\": NaN, \"addr_postcode\": NaN, \"opening_hours\": NaN, \"phone\": NaN, \"website\": NaN, \"lat\": 35.5328497, \"lon\": 10.9153757}, {\"osm_type\": \"node\", \"osm_id\": 12526639023, \"kind\": \"fuel_agil\", \"name\": \"AGIL oueslatia\", \"brand\": NaN, \"operator\": NaN, \"addr_full\": NaN, \"addr_street\": NaN, \"addr_city\": NaN, \"addr_postcode\": NaN, \"opening_hours\": NaN, \"phone\": NaN, \"website\": NaN, \"lat\": 35.8462354, \"lon\": 9.5957105}]"
+    },
+    {
+      "source": "data\\tunisia_charging_stations.csv",
+      "text": "CSV tunisia_charging_stations.csv columns=['osm_type', 'osm_id', 'kind', 'name', 'brand', 'operator', 'addr_full', 'addr_street', 'addr_city', 'addr_postcode', 'opening_hours', 'phone', 'website', 'lat', 'lon', 'socket:schuko', 'socket:type2', 'socket:type2:output', 'socket:ccs', 'socket:ccs2', 'socket:chademo', 'capacity', 'capacity:charging_points', 'power', 'maxcurrent', 'voltage', 'authentication', 'operator:wikidata', 'network', 'fee', 'payment:credit_cards', 'authentication:app', 'authentication:membership_card', 'charge:output'] sample=[{\"osm_type\": \"node\", \"osm_id\": 12449852375, \"kind\": \"charging_station\", \"name\": \"Charging Station Total Kortoba\", \"brand\": NaN, \"operator\": \"TotalEnergies\", \"addr_full\": NaN, \"addr_street\": NaN, \"addr_city\": NaN, \"addr_postcode\": NaN, \"opening_hours\": NaN, \"phone\": NaN, \"website\": NaN, \"lat\": 34.8391928, \"lon\": 10.7647117, \"socket:schuko\": NaN, \"socket:type2\": NaN, \"socket:type2:output\": NaN, \"socket:ccs\": NaN, \"socket:ccs2\": NaN, \"socket:chademo\": NaN, \"capacity\": NaN, \"capacity:charging_points\": NaN, \"power\": NaN, \"maxcurrent\": NaN, \"voltage\": NaN, \"authentication\": NaN, \"operator:wikidata\": \"Q154037\", \"network\": NaN, \"fee\": NaN, \"payment:credit_cards\": NaN, \"authentication:app\": NaN, \"authentication:membership_card\": NaN, \"charge:output\": NaN}, {\"osm_type\": \"way\", \"osm_id\": 1159157858, \"kind\": \"charging_station\", \"name\": \"shell sidi hassine 2$\", \"brand\": NaN, \"operator\": \"Shell\", \"addr_full\": NaN, \"addr_street\": NaN, \"addr_city\": NaN, \"addr_postcode\": NaN, \"opening_hours\": NaN, \"phone\": NaN, \"website\": NaN, \"lat\": 36.7643006, \"lon\": 10.1192249, \"socket:schuko\": NaN, \"socket:type2\": NaN, \"socket:type2:output\": NaN, \"socket:ccs\": NaN, \"socket:ccs2\": NaN, \"socket:chademo\": NaN, \"capacity\": NaN, \"capacity:charging_points\": NaN, \"power\": NaN, \"maxcurrent\": NaN, \"voltage\": NaN, \"authentication\": NaN, \"operator:wikidata\": \"Q110716465\", \"network\": NaN, \"fee\": NaN, \"payment:credit_cards\": NaN, \"authentication:app\": NaN, \"authentication:membership_card\": NaN, \"charge:output\": NaN}, {\"osm_type\": \"node\", \"osm_id\": 4510850190, \"kind\": \"charging_station\", \"name\": NaN, \"brand\": NaN, \"operator\": NaN, \"addr_full\": NaN, \"addr_street\": NaN, \"addr_city\": NaN, \"addr_postcode\": NaN, \"opening_hours\": NaN, \"phone\": NaN, \"website\": NaN, \"lat\": 36.7807266, \"lon\": 10.1937043, \"socket:schuko\": NaN, \"socket:type2\": NaN, \"socket:type2:output\": NaN, \"socket:ccs\": NaN, \"socket:ccs2\": NaN, \"socket:chademo\": NaN, \"capacity\": NaN, \"capacity:charging_points\": NaN, \"power\": NaN, \"maxcurrent\": NaN, \"voltage\": NaN, \"authentication\": NaN, \"operator:wikidata\": NaN, \"network\": NaN, \"fee\": NaN, \"payment:credit_cards\": NaN, \"authentication:app\": NaN, \"authentication:membership_card\": NaN, \"charge:output\": NaN}]"
+    },
+    {
+      "source": "data\\processed_sites.csv",
+      "text": "CSV processed_sites.csv columns=['osm_type', 'osm_id', 'kind', 'name', 'brand', 'operator', 'addr_full', 'addr_street', 'addr_city', 'addr_postcode', 'opening_hours', 'phone', 'website', 'lat', 'lon', 'nearest_charger_km', 'site_score'] sample=[{\"osm_type\": \"node\", \"osm_id\": 9368376586, \"kind\": \"fuel_agil\", \"name\": \"عجيل\", \"brand\": \"Agil\", \"operator\": NaN, \"addr_full\": NaN, \"addr_street\": NaN, \"addr_city\": NaN, \"addr_postcode\": NaN, \"opening_hours\": NaN, \"phone\": NaN, \"website\": NaN, \"lat\": 33.8736555, \"lon\": 7.8950627, \"nearest_charger_km\": 284.44688470182376, \"site_score\": 284.6468847018237}, {\"osm_type\": \"node\", \"osm_id\": 9022342158, \"kind\": \"fuel_agil\", \"name\": \"عجيل\", \"brand\": \"Agil\", \"operator\": \"الشركة الوطنية لتوزيع البترول\", \"addr_full\": NaN, \"addr_street\": NaN, \"addr_city\": \"رمادة\", \"addr_postcode\": NaN, \"opening_hours\": NaN, \"phone\": NaN, \"website\": NaN, \"lat\": 32.3199182, \"lon\": 10.3985487, \"nearest_charger_km\": 282.17642964030284, \"site_score\": 282.37642964030283}, {\"osm_type\": \"node\", \"osm_id\": 7468425225, \"kind\": \"fuel_agil\", \"name\": \"عجيل\", \"brand\": \"Agil\", \"operator\": NaN, \"addr_full\": NaN, \"addr_street\": NaN, \"addr_city\": NaN, \"addr_postcode\": NaN, \"opening_hours\": NaN, \"phone\": NaN, \"website\": NaN, \"lat\": 33.9781045, \"lon\": 8.2080614, \"nearest_charger_km\": 253.32519999672863, \"site_score\": 253.52519999672865}, {\"osm_type\": \"node\", \"osm_id\": 9944920261, \"kind\": \"fuel_agil\", \"name\": \"عجيل\", \"brand\": \"Agil\", \"operator\": NaN, \"addr_full\": NaN, \"addr_street\": NaN, \"addr_city\": NaN, \"addr_postcode\": NaN, \"opening_hours\": NaN, \"phone\": NaN, \"website\": NaN, \"lat\": 33.3617719, \"lon\": 8.6863593, \"nearest_charger_km\": 252.19700944700168, \"site_score\": 252.3970094470017}, {\"osm_type\": \"way\", \"osm_id\": 1070347342, \"kind\": \"fuel_agil\", \"name\": \"عجيل\", \"brand\": \"Agil\", \"operator\": NaN, \"addr_full\": NaN, \"addr_street\": NaN, \"addr_city\": NaN, \"addr_postcode\": NaN, \"opening_hours\": NaN, \"phone\": NaN, \"website\": NaN, \"lat\": 32.9315266, \"lon\": 10.4508394, \"nearest_charger_km\": 214.09221287471996, \"site_score\": 214.29221287471992}]"
+    }
+  ]
+}

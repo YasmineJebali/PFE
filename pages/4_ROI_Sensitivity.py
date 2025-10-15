@@ -14,6 +14,19 @@ import pandas as pd
 import streamlit as st
 import altair as alt
 
+from utils.ui import set_page, sidebar_nav, breadcrumbs, status_pills
+set_page("ROI & Sensitivity", icon="💸")
+sidebar_nav(__file__)
+breadcrumbs([
+    ("Home", "pages/0_Home.py"),
+    ("ROI & Sensitivity", "pages/4_ROI_Sensitivity.py"),
+])
+status_pills()
+
+
+st.page_link("pages/6_Chatbot.py", label="💬 Ask the Assistant")
+
+
 # Optional config (paths)
 try:
     from config import PATHS
@@ -236,6 +249,10 @@ if use_portfolio:
 if use_portfolio:
     st.dataframe(dfF.head(15), use_container_width=True)
 
+
+    st.caption("Using forecast for portfolio NPV.")
+    st.page_link("pages/5_Deployment_ROI.py", label="Next → Deployment ROI", icon="🧭")
+ 
     # Convert cumulative "chargers_needed" into yearly additions
     y0 = int(dfF["year"].iloc[0])
     cum = dfF["chargers_needed"].to_numpy()
