@@ -23,9 +23,7 @@ breadcrumbs([
 ])
 status_pills()
 
-
 st.page_link("pages/6_Chatbot.py", label="💬 Ask the Assistant")
-
 
 # Optional config (paths)
 try:
@@ -158,6 +156,47 @@ def discounted_cum_chart(df, title="Discounted cumulative cashflow"):
     zero = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(strokeDash=[6,3], color="black").encode(y="y:Q")
     return (line + zero).properties(title=title, height=320)
 
+# NEW: Bar chart helper with unclipped axes/labels
+def cashflow_bar_chart(df, x_field, x_title="Year (t)"):
+    ch = (
+        alt.Chart(df)
+        .mark_bar()
+        .encode(
+            x=alt.X(
+                f"{x_field}:O",
+                title=x_title,
+                axis=alt.Axis(
+                    labelAngle=0,        # horizontal labels
+                    labelPadding=8,      # space from axis
+                    labelLimit=1000      # avoid truncation
+                ),
+            ),
+            y=alt.Y(
+                "cashflow:Q",
+                title="Cashflow (TND)",
+                axis=alt.Axis(
+                    labelPadding=8,
+                    labelLimit=1000,
+                    format=",.0f"
+                ),
+            ),
+            tooltip=[
+                alt.Tooltip(f"{x_field}:O", title=x_title),
+                alt.Tooltip("cashflow:Q", format=",.0f"),
+            ],
+        )
+        .properties(
+            height=320,
+            padding={"left": 70, "right": 20, "top": 10, "bottom": 50}
+        )
+        .configure_axis(
+            labelFontSize=13,
+            titleFontSize=14
+        )
+        .configure_view(strokeOpacity=0)
+    )
+    return ch
+
 # ---------------- Inputs ----------------
 c1, c2, c3, c4, c5 = st.columns(5)
 capex = c1.number_input("CAPEX per charger (TND)", 2000, 200000, 36000, step=1000)
@@ -191,9 +230,14 @@ mcol4.metric("IRR", "n/a" if irr_unit is None else f"{irr_unit*100:.1f}%")
 
 st.caption("Cashflows per charger (undiscounted):")
 df_unit_cf = pd.DataFrame({"year": np.arange(0, years + 1), "cashflow": cf_unit})
-st.bar_chart(df_unit_cf.set_index("year"))
 
-# NEW: discounted cumulative chart for per-charger
+# REPLACED: st.bar_chart → Altair with safe axes
+st.altair_chart(
+    cashflow_bar_chart(df_unit_cf, x_field="year", x_title="Year (t)"),
+    use_container_width=True
+)
+
+# Discounted cumulative chart for per-charger
 df_unit_disc = discounted_cumulative_df(cf_unit, rate, label="Per-charger")
 st.altair_chart(discounted_cum_chart(df_unit_disc, "Discounted cumulative — per charger"), use_container_width=True)
 
@@ -249,10 +293,9 @@ if use_portfolio:
 if use_portfolio:
     st.dataframe(dfF.head(15), use_container_width=True)
 
-
     st.caption("Using forecast for portfolio NPV.")
     st.page_link("pages/5_Deployment_ROI.py", label="Next → Deployment ROI", icon="🧭")
- 
+
     # Convert cumulative "chargers_needed" into yearly additions
     y0 = int(dfF["year"].iloc[0])
     cum = dfF["chargers_needed"].to_numpy()
@@ -285,10 +328,21 @@ if use_portfolio:
         "chargers_in_service": in_service,
         "cashflow": cf_port
     })
-    st.line_chart(df_port.set_index("year_index")[["chargers_in_service"]])
-    st.bar_chart(df_port.set_index("year_index")[["cashflow"]])
 
-    # NEW: discounted cumulative chart for portfolio
+    # Keep the line chart for in-service count
+    st.line_chart(df_port.set_index("year_index")[["chargers_in_service"]])
+
+    # REPLACED: cashflow bar chart with Altair + safe axes
+    st.altair_chart(
+        cashflow_bar_chart(
+            df_port.rename(columns={"year_index": "year"}),  # reuse helper
+            x_field="year",
+            x_title="Year index (t)"
+        ),
+        use_container_width=True
+    )
+
+    # Discounted cumulative chart for portfolio
     df_port_disc = discounted_cumulative_df(cf_port, rate, label="Portfolio")
     st.altair_chart(discounted_cum_chart(df_port_disc, "Discounted cumulative — portfolio"),
                     use_container_width=True)

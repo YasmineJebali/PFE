@@ -1,0 +1,23 @@
+digraph preprocessing_pipeline {
+	fontname=Arial fontsize=12 rankdir=LR
+	IEA [label="IEA EV Explorer
+(Global EV Data)" fillcolor="#dbeafe" shape=folder style=filled]
+	WDI [label="World Bank WDI
+(Socioeconomic Data)" fillcolor="#dbeafe" shape=folder style=filled]
+	OSM [label="OpenStreetMap API
+(Geospatial Data)" fillcolor="#dbeafe" shape=folder style=filled]
+	INS [label="INS Tunisia
+(National Statistics)" fillcolor="#dbeafe" shape=folder style=filled]
+	CLEAN [label="Python Cleaning Scripts
+(fetch_osm, process_sites, etc.)" fillcolor="#e0f2fe" shape=box style=filled]
+	DATA [label="Clean Datasets
+(CSV / Parquet)" fillcolor="#fef9c3" shape=component style=filled]
+	APP [label="Streamlit App
+(Map, ML, Modeling, ROI, Chatbot)" fillcolor="#dcfce7" shape=box3d style=filled]
+	IEA -> CLEAN [label="ingest + preprocess"]
+	WDI -> CLEAN [label="ingest + preprocess"]
+	OSM -> CLEAN [label="ingest + preprocess"]
+	INS -> CLEAN [label="ingest + preprocess"]
+	CLEAN -> DATA [label="save CSV outputs"]
+	DATA -> APP [label="load into pages"]
+}
