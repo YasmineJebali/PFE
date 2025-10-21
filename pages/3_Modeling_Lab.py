@@ -16,6 +16,20 @@ import pandas as pd
 import streamlit as st
 import altair as alt
 
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# NEW: styling helpers for clearer axes & legends (consistent with other pages)
+TITLE_SIZE = 16
+LABEL_SIZE = 13
+LEGEND_TITLE = 14
+LEGEND_LABEL = 12
+
+def style_chart(ch: alt.Chart) -> alt.Chart:
+    return (
+        ch.configure_axis(titleFontSize=TITLE_SIZE, labelFontSize=LABEL_SIZE)
+          .configure_legend(titleFontSize=LEGEND_TITLE, labelFontSize=LEGEND_LABEL)
+    )
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
 # Optional deps (handled gracefully)
 try:
     from prophet import Prophet  # pip install prophet
@@ -461,6 +475,67 @@ with tab_cv:
     st.markdown("#### 📊 Cross-validation summary (out-of-sample)")
     st.caption("Lower RMSE/MAE/MAPE and higher R² are better. Values are computed only on predictions for t+1.")
     st.dataframe(metric_df, use_container_width=True)
+# --- Exports: CV metrics CSV + LaTeX + short write-up ---
+colx, coly = st.columns([2, 1])
+
+with colx:
+    st.download_button(
+        "⬇️ Download CV metrics (CSV)",
+        data=metric_df.to_csv(index=False).encode(),
+        file_name=f"{country.lower().replace(' ','_')}_{target_col}_cv_metrics.csv",
+        use_container_width=True
+    )
+
+# Build LaTeX table (rounded and clean names)
+def _latex_metrics_table(df: pd.DataFrame) -> str:
+    df2 = df.copy()
+    df2["RMSE"] = df2["RMSE"].map(lambda v: f"{v:,.0f}")
+    df2["MAE"]  = df2["MAE"].map(lambda v: f"{v:,.0f}")
+    df2["MAPE"] = df2["MAPE"].map(lambda v: f"{(v*100):.1f}") if df2["MAPE"].max() < 1.0 else df2["MAPE"].map(lambda v: f"{v:.1f}")
+    df2["R²"]   = df2["R²"].map(lambda v: f"{v:.2f}")
+    show = df2[["Model","Points","RMSE","MAE","MAPE","R²"]].rename(columns={"MAPE":"MAPE (\\%)"})
+    # LaTeX
+    header = "\\begin{table}[H]\n\\centering\n\\caption{Rolling-origin CV performance (one-step ahead).}\n\\label{tab:model-results}\n\\renewcommand{\\arraystretch}{1.2}\n\\begin{tabular}{lccccc}\n\\toprule\nModel & Points & RMSE & MAE & MAPE (\\%) & $R^2$ \\\\\n\\midrule\n"
+    rows = "\n".join(" {} & {} & {} & {} & {} & {} \\\\".format(*r) for r in show.values)
+    footer = "\n\\bottomrule\n\\end{tabular}\n\\end{table}\n"
+    return header + rows + footer
+
+latex_txt = _latex_metrics_table(metric_df.reset_index(drop=True))
+
+with coly:
+    st.download_button(
+        "⬇️ Copy-ready LaTeX (metrics)",
+        data=latex_txt.encode(),
+        file_name=f"{country.lower().replace(' ','_')}_{target_col}_cv_metrics.tex",
+        use_container_width=True
+    )
+
+with st.expander("📝 Auto write-up (paste in thesis)", expanded=False):
+    try:
+        best = metric_df.iloc[0]
+        st.markdown(
+            f"""
+**Summary.** Using rolling-origin one-step-ahead CV on **{country} / {target_col}**, the best model is **{best['Model']}** with RMSE={best['RMSE']:.0f}, MAE={best['MAE']:.0f}, MAPE={(best['MAPE']*100 if best['MAPE']<1 else best['MAPE']):.1f}%, $R^2$={best['R²']:.2f}.  
+Interpretable baselines (Logistic/Polynomial) remain useful for scenario communication, while tree ensembles tend to minimize short-horizon error.
+"""
+        )
+    except Exception:
+        st.info("Run CV to generate the auto write-up.")
+
+
+
+    # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+    # NEW: Best model callout (by lowest RMSE) & expose to session_state
+    try:
+        _best_row = metric_df.iloc[0]
+        _best_model_name = str(_best_row["Model"])
+        _best_rmse = float(_best_row["RMSE"])
+        st.success(f"🏆 Best model (CV): **{_best_model_name}** — RMSE={_best_rmse:,.2f}")
+        st.session_state["best_model_name"] = _best_model_name
+        st.session_state["best_model_cv_rmse"] = _best_rmse
+    except Exception:
+        pass
+    # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
     # Chart: actual vs OOS predictions
     st.markdown("#### 📈 OOS predictions vs actual (each split)")
@@ -476,7 +551,8 @@ with tab_cv:
         color=alt.Color("model:N", title="Model"),
         tooltip=[alt.Tooltip("year:Q"), "model:N", alt.Tooltip("yhat:Q", format=",.0f")]
     )
-    st.altair_chart(line_true + line_models, use_container_width=True)
+    # Apply styling
+    st.altair_chart(style_chart(line_true + line_models), use_container_width=True)
 
     # Optional: XGB feature importance
     if use_xgb and HAVE_XGB and last_feat_info:
@@ -492,7 +568,8 @@ with tab_cv:
                 y=alt.Y("feature:N", sort="-x", title="Feature"),
                 tooltip=[alt.Tooltip("feature:N"), alt.Tooltip("gain:Q", format=",.3f")]
             ).properties(height=260)
-            st.altair_chart(imp_chart, use_container_width=True)
+            # Apply styling
+            st.altair_chart(style_chart(imp_chart), use_container_width=True)
         except Exception:
             pass
 
@@ -526,6 +603,16 @@ with tab_forecast:
         fitted_fut = logistic(future_years, Kf, rf, t0f)
         final_rows += [{"model":"Logistic","year":int(y),"value":float(v)} for y,v in zip(sub["year"], fitted_hist)]
         final_rows += [{"model":"Logistic","year":int(y),"value":float(v)} for y,v in zip(future_years, fitted_fut)]
+
+# Ensure numeric and drop bad rows once
+    sub = sub.copy()
+    sub["year"] = pd.to_numeric(sub["year"], errors="coerce")
+    sub[target_col] = pd.to_numeric(sub[target_col], errors="coerce")
+
+# Optional: if you prefer to fill gaps instead of dropping, use interpolate
+# sub[target_col] = sub[target_col].interpolate().ffill().bfill()
+
+    sub = sub.dropna(subset=["year", target_col]).sort_values("year")
 
     # Polynomial
     if 'use_poly2' in locals() and use_poly2:
@@ -622,7 +709,21 @@ with tab_forecast:
             )
             .properties(height=360)
         )
-        st.altair_chart(chart, use_container_width=True)
+
+        # Snapshot at strategic years (helps the thesis narrative)
+        snap_years = [2030, 2035, 2040]
+        snap = show_df[show_df["year"].isin(snap_years)].pivot(index="year", columns="model", values="value").sort_index()
+        st.markdown("#### 🎯 Snapshot at key years")
+        st.dataframe(snap, use_container_width=True)
+        st.download_button(
+    "⬇️ Download snapshot (CSV)",
+    data=snap.to_csv().encode(),
+    file_name=f"{country.lower().replace(' ','_')}_{target_col}_snapshot_2030_2035_2040.csv",
+    use_container_width=True
+)
+
+        # Apply styling
+        st.altair_chart(style_chart(chart), use_container_width=True)
 
         cdl, cdr = st.columns([2,1])
         with cdl:

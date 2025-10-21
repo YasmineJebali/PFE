@@ -1,4 +1,4 @@
-# pages/5_Deployment_ROI.py — Station-level deployment + ROI ranking (complete)
+# pages/5_Deployment_ROI.py — Station-level deployment + ROI ranking (complete + tiny upgrades)
 
 # --- Path bootstrap (must be first) ---
 from pathlib import Path
@@ -32,6 +32,15 @@ st.caption(
     "Allocate chargers to stations year-by-year to hit your forecast, then compute NPV & payback per station. "
     "Use weighted or round-robin allocation. Download ranked tables for your report."
 )
+
+# --- Link to Modeling Lab choice (optional banner) ---
+if "best_model_name" in st.session_state:
+    best_model = st.session_state["best_model_name"]
+    rmse = st.session_state.get("best_model_cv_rmse")
+    if rmse is not None:
+        st.info(f"🏆 Best forecasting model from Modeling Lab: **{best_model}** (RMSE={rmse:,.2f})")
+    else:
+        st.info(f"🏆 Best forecasting model from Modeling Lab: **{best_model}**")
 
 # ---------- Small finance helpers ----------
 def annual_net_profit_per_charger(margin_tnd_per_kwh, kwh_per_session, sessions_per_day, opex_per_year):
@@ -154,7 +163,7 @@ sess  = c5.number_input("Base sessions/day (per installed charger)", 1, 100, 3, 
 
 rate = st.slider("Discount rate", 0.01, 0.30, 0.11, 0.01, format="%.2f")
 
-# Weighting (traffic proxy)
+# Allocation strategy
 st.write("### Allocation strategy")
 cL, cR = st.columns(2)
 with cL:
@@ -171,6 +180,13 @@ with cR:
         index=0
     )
 alpha = st.slider("Sessions/day uplift factor from weight (0=no effect, 2=strong)", 0.0, 2.0, 0.5, 0.1)
+
+# Optional cap per station per year (0 = no cap; default keeps old behavior)
+max_per_station_year = st.number_input(
+    "Optional cap: max installs per station per year (0 = no cap)",
+    min_value=0, max_value=100, value=0, step=1,
+    help="Keeps yearly installs per site under a fixed cap if > 0."
+)
 
 # Build weight vector
 def pick_weights(df, need_col_choice):
@@ -194,8 +210,9 @@ def pick_weights(df, need_col_choice):
 w_norm = pick_weights(stations_df, need_col)
 stations_df["_weight"] = w_norm
 
-# Sessions/day per station = base * (1 + alpha * weight)
+# Sessions/day per station = base * (1 + alpha * weight)  (with guards)
 stations_df["_sessions_day"] = sess * (1.0 + alpha * stations_df["_weight"])
+stations_df["_sessions_day"] = stations_df["_sessions_day"].clip(lower=0.1)  # avoid zeros/negatives
 
 # ---------- Build yearly install plan from forecast ----------
 years_abs = forecast_df["year"].to_numpy()
@@ -220,21 +237,29 @@ def allocate_round_robin(adds_dict, N):
     """
     Returns dict: station_id -> {t_index -> installs}
     Evenly spreads new chargers each year across stations.
+    Respects optional max_per_station_year cap if > 0.
     """
     install = {sid: {} for sid in station_ids}
     rr_index = 0
     for t in range(0, horizon_years + 1):
         to_place = int(adds_dict.get(t, 0))
-        for _ in range(to_place):
+        placed = 0
+        guard = 0
+        while placed < to_place and guard < to_place * 5 + 1000:
             sid = station_ids[rr_index % N]
-            install[sid][t] = install[sid].get(t, 0) + 1
+            current = install[sid].get(t, 0)
+            # respect cap if any
+            if max_per_station_year == 0 or current < max_per_station_year:
+                install[sid][t] = current + 1
+                placed += 1
             rr_index += 1
+            guard += 1
     return install
 
 def allocate_weighted(adds_dict, weights):
     """
     Returns dict: station_id -> {t_index -> installs}
-    Distributes per year proportional to weights.
+    Distributes per year proportional to weights. Respects optional cap.
     """
     w = np.array(weights, dtype=float)
     w = np.where(w < 0, 0, w)
@@ -251,18 +276,60 @@ def allocate_weighted(adds_dict, weights):
         base = np.floor(exp).astype(int)
         remainder = to_place - base.sum()
         frac_rank = np.argsort(-(exp - base))
-        for i in range(remainder):
-            base[frac_rank[i]] += 1
+
+        # start with base (respecting any cap)
         for idx, count in enumerate(base):
+            if count <= 0:
+                continue
+            sid = station_ids[idx]
+            if max_per_station_year > 0:
+                allowed = max_per_station_year - install[sid].get(t, 0)
+                count = max(0, min(count, allowed))
             if count > 0:
-                sid = station_ids[idx]
                 install[sid][t] = install[sid].get(t, 0) + int(count)
+
+        # place remainder greedily (still respect cap)
+        for idx in frac_rank:
+            if remainder <= 0:
+                break
+            sid = station_ids[idx]
+            cur = install[sid].get(t, 0)
+            if (max_per_station_year == 0) or (cur < max_per_station_year):
+                install[sid][t] = cur + 1
+                remainder -= 1
     return install
 
 if strategy == "Round-robin (even)":
     schedule = allocate_round_robin(adds_per_year, N)
 else:
     schedule = allocate_weighted(adds_per_year, stations_df["_weight"].to_numpy())
+
+# --- Sanity KPIs and allocation vs forecast check ---
+# Rebuild per-year installs from schedule
+alloc_by_year = {t:0 for t in range(0, horizon_years + 1)}
+for sid, plan in schedule.items():
+    for t, n in plan.items():
+        alloc_by_year[t] = alloc_by_year.get(t, 0) + int(n)
+
+total_alloc = int(sum(alloc_by_year.values()))
+total_forecast_adds = int(sum(adds_per_year.values()))
+k1, k2, k3 = st.columns(3)
+k1.metric("Total new chargers allocated", f"{total_alloc:,}")
+k2.metric("Total new chargers requested (forecast)", f"{total_forecast_adds:,}")
+k3.metric("Match", "✅ perfect" if total_alloc == total_forecast_adds else "⚠️ mismatch")
+
+# Compact chart to compare per-year requested vs allocated
+df_req = pd.DataFrame({
+    "year": [start_year + t for t in sorted(adds_per_year.keys())],
+    "adds_requested": [adds_per_year[t] for t in sorted(adds_per_year.keys())]
+})
+df_alloc = pd.DataFrame({
+    "year": [start_year + t for t in sorted(alloc_by_year.keys())],
+    "adds_allocated": [alloc_by_year[t] for t in sorted(alloc_by_year.keys())]
+})
+df_check = df_req.merge(df_alloc, on="year", how="outer").fillna(0)
+st.markdown("#### Allocation vs Forecast (per year)")
+st.bar_chart(df_check.set_index("year")[["adds_requested", "adds_allocated"]], height=220)
 
 # ---------- Compute per-station ROI ----------
 capex_f = float(capex)
@@ -312,6 +379,32 @@ st.download_button(
     file_name="station_roi_ranking.csv",
     use_container_width=True,
 )
+
+# Build a long table of station x year installs (for audit/export)
+rows_sched = []
+for sid, plan in schedule.items():
+    for t, n in plan.items():
+        rows_sched.append({"station_id": sid, "year": int(start_year + t), "installs": int(n)})
+df_schedule_long = pd.DataFrame(rows_sched).sort_values(["year","station_id"])
+
+st.download_button(
+    "⬇️ Download deployment schedule (all stations, CSV)",
+    data=df_schedule_long.to_csv(index=False).encode(),
+    file_name="deployment_schedule_all_stations.csv",
+    use_container_width=True,
+)
+
+# ---------- Optional: Portfolio consistency check vs sum of station CFs ----------
+T = horizon_years
+cf_sum = np.zeros(T + 1, dtype=float)
+for sid, pack in per_station_cf.items():
+    cf_sum += pack["cf"]
+
+portfolio_npv = npv_from_cf(cf_sum, float(rate))
+portfolio_pb = payback_year(cf_sum)
+pc1, pc2 = st.columns(2)
+pc1.metric("Portfolio NPV (sum of stations)", f"{portfolio_npv:,.0f}")
+pc2.metric("Portfolio payback (undiscounted)", "No payback" if portfolio_pb is None else f"Year {portfolio_pb}")
 
 # ---------- Quick map of top candidates ----------
 if stations_df[["lat","lon"]].dropna().shape[0] > 0 and not df_rank.empty:

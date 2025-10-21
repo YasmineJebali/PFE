@@ -1,0 +1,502 @@
+# pages/1_Map_&_Gaps.py — Map & Gaps (polished UI + clustered markers + optional heatmap + ranking + forecast + risk)
+# Keeps your original logic; improves axis/legend sizes; robust fallbacks for utils.ui; hands forecast to ROI pages.
+
+# --- 0) Path bootstrap (must be first) ---
+from pathlib import Path
+import sys
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+# --- 1) Imports ---
+import math
+import os
+import numpy as np
+import pandas as pd
+import streamlit as st
+import altair as alt
+
+import folium
+from folium.plugins import MarkerCluster, HeatMap
+from streamlit_folium import st_folium
+
+# --- 2) UI helpers (safe fallbacks if utils/ui.py not present) ---
+def _fallback_set_page(title, icon=None):
+    st.set_page_config(page_title=title, layout="wide")
+    st.title(title)
+
+def _fallback_sidebar_nav(_file): pass
+def _fallback_breadcrumbs(_items): pass
+def _fallback_status_pills(): pass
+
+try:
+    from utils.ui import set_page, sidebar_nav, breadcrumbs, status_pills
+except Exception:
+    set_page = _fallback_set_page
+    sidebar_nav = _fallback_sidebar_nav
+    breadcrumbs = _fallback_breadcrumbs
+    status_pills = _fallback_status_pills
+
+# --- 3) Page meta ---
+set_page("🗺️ Map & Gaps")
+sidebar_nav(__file__)
+breadcrumbs([("Home", "pages/0_Home.py"), ("Map & Gaps", "pages/1_Map_&_Gaps.py")])
+status_pills()
+
+st.caption("Path: Home → **Map & Gaps** → Analogs & ML → Modeling Lab → ROI → Deployment ROI")
+st.page_link("pages/2_Analogs_and_ML.py", label="Next → Analogs & ML", icon="📊")
+
+st.markdown("""
+**Purpose:** This page sets the national context — where chargers are today, where demand will emerge,
+and **when** the market becomes viable. Results here feed the ROI and Deployment pages.
+""")
+
+# ---------- Altair style helpers (bigger/clearer axes & legends) ----------
+TITLE_SIZE = 16
+LABEL_SIZE = 13
+LEGEND_TITLE = 14
+LEGEND_LABEL = 12
+
+def style_chart(ch: alt.Chart) -> alt.Chart:
+    return (
+        ch.configure_axis(titleFontSize=TITLE_SIZE, labelFontSize=LABEL_SIZE)
+          .configure_legend(titleFontSize=LEGEND_TITLE, labelFontSize=LEGEND_LABEL)
+    )
+
+# --- 4) Paths & IO helpers ---
+DATA_DIR = Path("data")
+AGIL_CSV = DATA_DIR / "tunisia_agil_stations.csv"
+CHARGERS_CSV = DATA_DIR / "tunisia_charging_stations.csv"
+PROCESSED_CSV = DATA_DIR / "processed_sites.csv"  # optional (scores/distances)
+
+def load_csv(path: Path) -> pd.DataFrame:
+    """Load CSV safely → always return DataFrame. Coerce basic types."""
+    try:
+        if not path.exists():
+            return pd.DataFrame()
+        df = pd.read_csv(path)
+        if isinstance(df, np.ndarray):
+            df = pd.DataFrame(df)
+        if not isinstance(df, pd.DataFrame):
+            return pd.DataFrame()
+        # Basic column normalization
+        df.columns = [c.strip() for c in df.columns]
+        # Best-effort lat/lon coercion if present
+        if "lat" in df.columns:
+            df["lat"] = pd.to_numeric(df["lat"], errors="coerce")
+        if "lon" in df.columns:
+            df["lon"] = pd.to_numeric(df["lon"], errors="coerce")
+        return df
+    except Exception as e:
+        st.error(f"Failed to read {path}: {e}")
+        return pd.DataFrame()
+
+agil = load_csv(AGIL_CSV)
+chargers = load_csv(CHARGERS_CSV)
+processed = load_csv(PROCESSED_CSV)
+
+# Expose stations to other pages (ROI, Deployment)
+try:
+    if isinstance(agil, pd.DataFrame) and not agil.empty:
+        df_st = agil.copy()
+        if "osm_id" in df_st.columns and "id" not in df_st.columns:
+            df_st = df_st.rename(columns={"osm_id": "id"})
+        if "id" not in df_st.columns:
+            df_st["id"] = np.arange(1, len(df_st) + 1)
+        if "name" not in df_st.columns:
+            df_st["name"] = "Agil station"
+        essentials = [c for c in ["id", "name", "lat", "lon"] if c in df_st.columns]
+        if set(["lat", "lon"]).issubset(essentials):
+            df_st = df_st[essentials].dropna(subset=["lat", "lon"]).reset_index(drop=True)
+            st.session_state["stations_df"] = df_st
+except Exception:
+    pass
+
+# --- 5) Governorates reference (centroids + pop) ---
+GOV_COORDS = {
+    "Ariana": (36.8625, 10.1956), "Beja": (36.7330, 9.1830), "Ben Arous": (36.7472, 10.3333),
+    "Bizerte": (37.2670, 9.8670), "Gabes": (33.8830, 10.1170), "Gafsa": (34.4170, 8.7830),
+    "Jendouba": (36.5000, 8.7830), "Kairouan": (35.6670, 10.1000), "Kasserine": (35.1670, 8.8330),
+    "Kebili": (33.7019, 8.9736), "Kef": (36.1822, 8.7147), "Mahdia": (35.5000, 11.0670),
+    "Manouba": (36.8078, 10.1011), "Medenine": (33.3547, 10.5053), "Monastir": (35.7830, 10.8330),
+    "Nabeul": (36.7500, 10.7500), "Sfax": (34.7330, 10.7670), "Sidi Bouzid": (35.0330, 9.5000),
+    "Siliana": (36.1670, 9.3670), "Sousse": (35.8330, 10.6330), "Tataouine": (32.9256, 10.4442),
+    "Tozeur": (33.9170, 8.1330), "Tunis": (36.8000, 10.1700), "Zaghouan": (36.4000, 10.1500),
+}
+GOV_POP = {
+    "Ariana": 668_552, "Beja": 311_417, "Ben Arous": 722_828, "Bizerte": 607_388,
+    "Gabes": 410_847, "Gafsa": 388_776, "Jendouba": 404_352, "Kairouan": 600_803,
+    "Kasserine": 492_741, "Kebili": 183_201, "Kef": 237_686, "Mahdia": 449_985,
+    "Manouba": 418_354, "Medenine": 537_255, "Monastir": 599_769, "Nabeul": 863_172,
+    "Sfax": 1_047_468, "Sidi Bouzid": 489_991, "Siliana": 216_242, "Sousse": 762_281,
+    "Tataouine": 162_654, "Tozeur": 120_036, "Tunis": 1_075_306, "Zaghouan": 201_065
+}
+TOTAL_POP = sum(GOV_POP.values())
+GOV_ORDER = list(GOV_COORDS.keys())
+
+def nearest_governorate(lat: float, lon: float) -> str | None:
+    """Haversine distance to governorate centroids; return closest name."""
+    min_dist = float("inf")
+    nearest = None
+    for gov, (glat, glon) in GOV_COORDS.items():
+        dlat = math.radians(lat - glat)
+        dlon = math.radians(lon - glon)
+        a = math.sin(dlat/2)**2 + math.cos(math.radians(glat))*math.cos(math.radians(lat))*math.sin(dlon/2)**2
+        c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+        dist = 6371 * c
+        if dist < min_dist:
+            min_dist = dist
+            nearest = gov
+    return nearest
+
+# --- 6) Tabs ---
+tab_map, tab_rank, tab_forecast, tab_risk = st.tabs(["🗺️ Map", "🏆 Ranking", "📈 Forecast", "🎲 Risk"])
+
+# ============================= MAP =============================
+with tab_map:
+    st.subheader("Map of Agil stations and public charging points")
+    st.info("**How to read this:** teal = public chargers (⚡), orange = Agil stations (⛽). "
+            "Zoom into dense zones; areas with many ⛽ and few ⚡ are early candidates.")
+
+    # KPI strip
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Agil stations loaded", f"{0 if agil.empty else len(agil):,}")
+    c2.metric("Public chargers loaded", f"{0 if chargers.empty else len(chargers):,}")
+    if not agil.empty and not chargers.empty:
+        cov = len(chargers) / max(len(agil), 1)
+        c3.metric("Chargers per Agil site", f"{cov:.2f}")
+    else:
+        c3.metric("Chargers per Agil site", "—")
+    c4.metric("Governorates in data", f"{len(GOV_COORDS)}")
+
+    # Map options
+    with st.expander("Map options", expanded=True):
+        colM1, colM2 = st.columns(2)
+        with colM1:
+            show_heat = st.checkbox("Add charger heatmap (density)", value=False)
+        with colM2:
+            min_zoom = st.slider("Initial zoom", 4, 9, 6)
+
+    # Compute map center robustly
+    def _center_latlon(agil_df: pd.DataFrame, ch_df: pd.DataFrame) -> tuple[float, float]:
+        lat_series = pd.Series(dtype=float); lon_series = pd.Series(dtype=float)
+        if isinstance(agil_df, pd.DataFrame) and not agil_df.empty and {"lat","lon"}.issubset(agil_df.columns):
+            lat_series = pd.concat([lat_series, agil_df["lat"]], ignore_index=True)
+            lon_series = pd.concat([lon_series, agil_df["lon"]], ignore_index=True)
+        if isinstance(ch_df, pd.DataFrame) and not ch_df.empty and {"lat","lon"}.issubset(ch_df.columns):
+            lat_series = pd.concat([lat_series, ch_df["lat"]], ignore_index=True)
+            lon_series = pd.concat([lon_series, ch_df["lon"]], ignore_index=True)
+        lat0 = float(np.nanmean(lat_series)) if not lat_series.empty else np.nan
+        lon0 = float(np.nanmean(lon_series)) if not lon_series.empty else np.nan
+        if np.isnan(lat0) or np.isnan(lon0):
+            return 34.0, 9.0  # Tunisia approx center
+        return lat0, lon0
+
+    lat0, lon0 = _center_latlon(agil, chargers)
+    m = folium.Map(location=[lat0, lon0], zoom_start=int(min_zoom), control_scale=True, tiles="CartoDB positron")
+
+    # Chargers (clustered + optional heat)
+    if isinstance(chargers, pd.DataFrame) and not chargers.empty and {"lat", "lon"}.issubset(chargers.columns):
+        ch_cluster = MarkerCluster(name="Public chargers").add_to(m)
+        heat_data = []
+        for _, row in chargers.iterrows():
+            if pd.notnull(row.get("lat")) and pd.notnull(row.get("lon")):
+                folium.CircleMarker(
+                    [row["lat"], row["lon"]],
+                    radius=4, color="#2a9d8f", fill=True, fill_opacity=0.85,
+                    popup=f"⚡ {row.get('name','(Charging)')}<br>{row.get('brand','')}"
+                ).add_to(ch_cluster)
+                heat_data.append([row["lat"], row["lon"], 1])
+        if show_heat and len(heat_data) > 0:
+            HeatMap(heat_data, radius=10, blur=12, name="Charger density").add_to(m)
+    else:
+        st.warning("⚠️ No valid charger data found (run fetch script or check CSV columns).")
+
+    # Agil stations (clustered)
+    if isinstance(agil, pd.DataFrame) and not agil.empty and {"lat", "lon"}.issubset(agil.columns):
+        ag_cluster = MarkerCluster(name="Agil stations").add_to(m)
+        for _, row in agil.iterrows():
+            if pd.notnull(row.get("lat")) and pd.notnull(row.get("lon")):
+                folium.CircleMarker(
+                    [row["lat"], row["lon"]],
+                    radius=4, color="#e76f51", fill=True, fill_opacity=0.85,
+                    popup=f"⛽ {row.get('name','Agil station')}"
+                ).add_to(ag_cluster)
+    else:
+        st.warning("⚠️ No valid Agil station data found (run fetch script or check CSV columns).")
+
+    folium.LayerControl(collapsed=False).add_to(m)
+    st_folium(m, width=None, height=600)
+
+    with st.expander("🔎 Data snapshots"):
+        cL, cR = st.columns(2)
+        with cL:
+            st.caption("Agil stations (sample)")
+            st.dataframe(agil.head(10), use_container_width=True)
+        with cR:
+            st.caption("Public chargers (sample)")
+            st.dataframe(chargers.head(10), use_container_width=True)
+
+# ===================== RANKING (CITY VIEW + CURVES) =====================
+with tab_rank:
+    st.subheader("City (Governorate) EV Infrastructure & Demand")
+    st.info("We map each Agil station and public charger to the nearest governorate and compare "
+            "**population share** vs **station share** vs **charger share** to spot *underserved* regions. "
+            "Then we project city-level EV demand by scaling a national logistic curve by population share.")
+
+    # Map points to governorates
+    def map_to_gov(df, label):
+        if isinstance(df, pd.DataFrame) and not df.empty and {"lat","lon"}.issubset(df.columns):
+            out = df[["lat","lon"]].dropna().copy()
+            out["governorate"] = out.apply(lambda r: nearest_governorate(r["lat"], r["lon"]), axis=1)
+            return out
+        else:
+            st.warning(f"⚠️ No valid {label} data found for ranking.")
+            return pd.DataFrame(columns=["lat","lon","governorate"])
+
+    agil_gov = map_to_gov(agil, "Agil")
+    ch_gov = map_to_gov(chargers, "charger")
+
+    counts_st = agil_gov["governorate"].value_counts().reindex(GOV_ORDER, fill_value=0)
+    counts_ch = ch_gov["governorate"].value_counts().reindex(GOV_ORDER, fill_value=0)
+
+    gov_df = pd.DataFrame({
+        "governorate": GOV_ORDER,
+        "station_count": counts_st.values,
+        "charger_count": counts_ch.values
+    })
+    gov_df["population"] = gov_df["governorate"].map(GOV_POP)
+    gov_df["pop_share"] = gov_df["population"] / TOTAL_POP
+
+    total_st = max(int(gov_df["station_count"].sum()), 1)
+    total_ch = max(int(gov_df["charger_count"].sum()), 1)
+    gov_df["station_share"] = gov_df["station_count"] / total_st
+    gov_df["charger_share"] = gov_df["charger_count"] / total_ch
+
+    # Gap index: who is underserved relative to population
+    gov_df["gap_index_stations"] = (gov_df["pop_share"] - gov_df["station_share"]).round(4)
+    gov_df["gap_index_chargers"] = (gov_df["pop_share"] - gov_df["charger_share"]).round(4)
+
+    # Chargers per 100k pop (context KPI)
+    gov_df["chargers_per_100k"] = (gov_df["charger_count"] / gov_df["population"] * 100_000).round(2)
+
+    # KPI strip
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Stations mapped", f"{int(total_st):,}")
+    c2.metric("Public chargers mapped", f"{int(total_ch):,}")
+    c3.metric("Median gap (chargers)", f"{gov_df['gap_index_chargers'].median():+.3f}")
+    top_underserved = gov_df.sort_values("gap_index_chargers", ascending=False).head(1)
+    c4.metric("Top underserved (by chargers)", top_underserved.iloc[0]["governorate"] if not top_underserved.empty else "—")
+
+    # Balance chart (population vs station vs charger shares)
+    st.markdown("### Balance: population vs stations vs chargers")
+    df_long = gov_df.melt(
+        id_vars=["governorate"],
+        value_vars=["pop_share", "station_share", "charger_share"],
+        var_name="metric", value_name="share"
+    )
+    chart = (
+        alt.Chart(df_long)
+        .mark_bar()
+        .encode(
+            x=alt.X("governorate:N", sort=GOV_ORDER, title="Governorate"),
+            y=alt.Y("share:Q", axis=alt.Axis(format="%", title="Share")),
+            color=alt.Color("metric:N", title="Metric", scale=alt.Scale(scheme="tableau10")),
+            tooltip=[
+                alt.Tooltip("governorate:N"),
+                alt.Tooltip("metric:N"),
+                alt.Tooltip("share:Q", format=".1%"),
+            ],
+        )
+        .properties(height=320)
+    )
+    st.altair_chart(style_chart(chart), use_container_width=True)
+
+    st.markdown("### Summary tables")
+    left, right = st.columns([1.6, 1])
+    with left:
+        show_cols = ["governorate", "population", "station_count", "charger_count",
+                     "pop_share", "station_share", "charger_share",
+                     "gap_index_stations", "gap_index_chargers", "chargers_per_100k"]
+        st.dataframe(
+            gov_df.sort_values("gap_index_chargers", ascending=False).reset_index(drop=True)[show_cols],
+            use_container_width=True, height=360
+        )
+        st.download_button(
+            "⬇️ Download ranking table (CSV)",
+            data=gov_df.sort_values("gap_index_chargers", ascending=False)[show_cols].to_csv(index=False).encode(),
+            file_name="gov_ranking_gap_table.csv",
+            use_container_width=True,
+        )
+    with right:
+        st.write("**Top 8 underserved (by charger gap)**")
+        st.table(
+            gov_df.sort_values("gap_index_chargers", ascending=False)
+                  .head(8)[["governorate","gap_index_chargers","chargers_per_100k"]]
+                  .rename(columns={"governorate":"Gov","gap_index_chargers":"Gap","chargers_per_100k":"Chg/100k"})
+        )
+
+    st.divider()
+    st.markdown("### City EV curves (national logistic × population share)")
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        start_year = st.number_input("Start year", min_value=2024, max_value=2040, value=2025, step=1, key="city_start")
+    with c2:
+        end_year = st.number_input("End year", min_value=start_year, max_value=2050, value=2035, step=1, key="city_end")
+    with c3:
+        K = float(st.number_input("National Max EV stock K (thousands)", min_value=5, max_value=1000, value=150, step=5, key="cityK")) * 1000
+        r = st.number_input("Growth rate r", min_value=0.01, max_value=1.0, value=0.35, step=0.01, key="cityr")
+    with c4:
+        t0 = st.number_input("Midpoint year t0", min_value=2024, max_value=2050, value=2031, step=1, key="cityt0")
+
+    years = np.arange(start_year, end_year + 1)
+    national_ev = K / (1.0 + np.exp(-r * (years - t0)))
+
+    # City EV level by scaling national curve with population share
+    city_curves = []
+    for _, row in gov_df.iterrows():
+        curve = (row["pop_share"] * national_ev)
+        city_curves.append(pd.DataFrame({
+            "year": years,
+            "governorate": row["governorate"],
+            "ev_stock_city": curve
+        }))
+    city_curves_df = pd.concat(city_curves, ignore_index=True)
+
+    target_year = min(2030, end_year)
+    nat_target = float(K / (1.0 + np.exp(-r * (target_year - t0))))
+    gov_df[f"est_ev_{target_year}"] = (gov_df["pop_share"] * nat_target).astype(int)
+
+    st.markdown("### City EV curves (select)")
+    default_top = gov_df.sort_values("gap_index_chargers", ascending=False)["governorate"].head(5).tolist()
+    selected = st.multiselect(
+        "Select governorates to plot",
+        options=gov_df["governorate"].tolist(),
+        default=default_top,
+        help="Tip: start with the most underserved to visualize demand build-up."
+    )
+    if selected:
+        wide = (city_curves_df[city_curves_df["governorate"].isin(selected)]
+                .pivot(index="year", columns="governorate", values="ev_stock_city")
+                .round(0))
+        st.line_chart(wide)
+        st.caption("Curves show estimated **EV stock per governorate** over time (national logistic × population share).")
+    else:
+        st.info("Pick at least one governorate to draw curves.")
+
+# ======================== NATIONAL FORECAST ========================
+with tab_forecast:
+    st.subheader("Adoption & charger demand (scenario)")
+    st.info("Model national EV adoption with a logistic curve and derive charger needs via EV/charger ratio. "
+            "Use this as the baseline that feeds ROI and Deployment pages.")
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        start_year = st.number_input("Start year", min_value=2024, max_value=2040, value=2025, step=1, key="f_start")
+        end_year = st.number_input("End year", min_value=start_year, max_value=2050, value=2035, step=1, key="f_end")
+    with col2:
+        K = st.number_input("Max EV stock (K, thousands)", min_value=5, max_value=1000, value=150, step=5, key="f_K")
+        K = float(K) * 1000
+        r = st.number_input("Growth rate r (logistic)", min_value=0.01, max_value=1.0, value=0.35, step=0.01, key="f_r")
+    with col3:
+        t0 = st.number_input("Midpoint year t0", min_value=2024, max_value=2050, value=2031, step=1, key="f_t0")
+        ratio = st.number_input("EVs per public charger", min_value=5, max_value=50, value=18, step=1, key="f_ratio")
+
+    years = np.arange(start_year, end_year+1)
+    ev_stock = K / (1.0 + np.exp(-r * (years - t0)))
+    chargers_needed = ev_stock / ratio
+
+    df_forecast = pd.DataFrame({
+        "year": years,
+        "ev_stock": ev_stock.astype(int),
+        "chargers_needed": chargers_needed.astype(int)
+    })
+
+    # Store for ROI pages
+    st.session_state["forecast_df"] = df_forecast.copy()
+
+    # Chart (Altair for nicer labels)
+    plot_df = df_forecast.melt(id_vars="year", var_name="series", value_name="value")
+    chart = (
+        alt.Chart(plot_df)
+        .mark_line(point=True)
+        .encode(
+            x=alt.X("year:Q", title="Year"),
+            y=alt.Y("value:Q", title="Units (vehicles / chargers)"),
+            color=alt.Color("series:N", title="Series"),
+            tooltip=[alt.Tooltip("year:Q"), "series:N", alt.Tooltip("value:Q", format=",.0f")],
+        )
+        .properties(height=360)
+    )
+    st.altair_chart(style_chart(chart), use_container_width=True)
+
+    st.caption("**Tip:** Start conservative (e.g., EV/charger = 18–25) and stress-test in the Risk tab.")
+    st.download_button(
+        "⬇️ Download national forecast (CSV)",
+        data=df_forecast.to_csv(index=False).encode(),
+        file_name="national_ev_forecast.csv",
+        use_container_width=True,
+    )
+
+# ============================== RISK ==============================
+with tab_risk:
+    st.subheader("Monte Carlo on adoption assumptions")
+    st.info("Simulate uncertainty on **r** and **t₀** to estimate the **probable year** when charger demand crosses a threshold. "
+            "Use **P50** for baseline planning and **P90** for conservative timelines.")
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        ratio_mc = st.number_input("EVs per charger (risk)", min_value=5, max_value=50, value=18, step=1, key="ratio_mc")
+        chargers_threshold = st.number_input("Threshold chargers needed (market viability)", min_value=100, max_value=20000, value=1500, step=50)
+    with col2:
+        r_mean = st.number_input("r mean", min_value=0.05, max_value=1.0, value=0.35, step=0.01)
+        r_sd = st.number_input("r std", min_value=0.0, max_value=0.5, value=0.08, step=0.01)
+    with col3:
+        t0_mean = st.number_input("t0 mean", min_value=2024, max_value=2050, value=2031, step=1, key="t0_mean")
+        t0_sd = st.number_input("t0 std", min_value=0.0, max_value=5.0, value=1.5, step=0.1)
+
+    sims = st.number_input("Simulations", min_value=100, max_value=10000, value=2000, step=100)
+    horizon = st.slider("Forecast horizon (years)", 2025, 2045, (2025, 2038))
+
+    years = np.arange(horizon[0], horizon[1] + 1)
+    K = st.number_input("Max EV stock K (risk)", min_value=10000, max_value=5000000, value=150000, step=10000)
+
+    rng = np.random.default_rng(42)
+    r_draws = rng.normal(r_mean, r_sd, size=int(sims))
+    t0_draws = rng.normal(t0_mean, t0_sd, size=int(sims))
+
+    hit_years = []
+    for r_i, t0_i in zip(r_draws, t0_draws):
+        ev = K / (1.0 + np.exp(-r_i * (years - t0_i)))
+        chargers = ev / ratio_mc
+        above = years[chargers >= chargers_threshold]
+        hit_years.append(int(above[0]) if len(above) > 0 else np.nan)
+
+    hit_series = pd.Series(hit_years)
+    hist = hit_series.value_counts().sort_index().rename_axis("year").reset_index(name="count")
+
+    # Chart (Altair for larger labels)
+    bar = (
+        alt.Chart(hist)
+        .mark_bar()
+        .encode(
+            x=alt.X("year:Q", title="First year ≥ threshold chargers"),
+            y=alt.Y("count:Q", title="Simulations (count)"),
+            tooltip=[alt.Tooltip("year:Q"), alt.Tooltip("count:Q")]
+        )
+        .properties(height=320)
+    )
+    st.altair_chart(style_chart(bar), use_container_width=True)
+
+    import math as _math
+    p50 = hit_series.dropna().quantile(0.5) if hit_series.notna().any() else np.nan
+    p90 = hit_series.dropna().quantile(0.9) if hit_series.notna().any() else np.nan
+    st.write(f"**P50 year**: {p50:.0f}" if not _math.isnan(p50) else "P50 year: n/a")
+    st.write(f"**P90 year**: {p90:.0f}" if not _math.isnan(p90) else "P90 year: n/a")
+
+    st.download_button(
+        "⬇️ Download Monte Carlo hit-year distribution (CSV)",
+        data=hist.to_csv(index=False).encode(),
+        file_name="monte_carlo_hit_years.csv",
+        use_container_width=True,
+    )
